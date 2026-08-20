@@ -329,14 +329,15 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 user32.FindWindowW.restype = wintypes.HWND
 user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
 user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
-user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
 user32.BringWindowToTop.argtypes = [wintypes.HWND]
-kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
+user32.SystemParametersInfoW.restype = wintypes.BOOL
 SW_RESTORE = 9
+SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+SPIF_SENDCHANGE = 0x2
 
 
 def _bring_window_to_front(title, timeout=3.0):
@@ -347,9 +348,22 @@ def _bring_window_to_front(title, timeout=3.0):
     SetForegroundWindow silently no-ops here (own_manager is a background
     process with no recent input focus of its own - confirmed live,
     2026-08-20: the call succeeded but the window never actually came
-    forward) - Windows only allows it unconditionally for a thread that
-    already owns the foreground, so this borrows that via
-    AttachThreadInput first (the standard workaround for exactly this)."""
+    forward).
+
+    NOT using AttachThreadInput any more (that was the first fix here) -
+    it ties this thread's input queue to whichever process currently owns
+    the foreground, which at this exact moment is CHITUBOX itself (right
+    after the "Отправка по сети" click). If CHITUBOX's own thread is even
+    briefly busy right then, the entangled queue can make both windows
+    stop responding to input - not a real deadlock in our code, just
+    Windows failing to pump input for either side until they're detached -
+    and is the suspected cause of a real freeze seen live (2026-08-21,
+    before the printer list ever appeared - i.e. before send_in_background
+    was even reachable). Uses the standard alternative instead: briefly
+    zero out the system-wide foreground-lock timeout, call
+    SetForegroundWindow, put the timeout back - doesn't touch any other
+    process's thread state at all, so it can't get entangled with
+    whatever CHITUBOX's thread happens to be doing."""
     deadline = time.monotonic() + timeout
     hwnd = None
     while time.monotonic() < deadline:
@@ -361,23 +375,17 @@ def _bring_window_to_front(title, timeout=3.0):
         logmsg("=== _bring_window_to_front: window %r never appeared ===", title)
         return
 
-    # Standard workaround: borrow the current foreground thread's input
-    # state onto this thread so Windows lets it call SetForegroundWindow
-    # unconditionally, then drop it again.
-    fg_hwnd = user32.GetForegroundWindow()
-    fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
-    current_thread = kernel32.GetCurrentThreadId()
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    user32.BringWindowToTop(hwnd)
 
-    attached = False
-    if fg_thread and fg_thread != current_thread:
-        attached = bool(user32.AttachThreadInput(current_thread, fg_thread, True))
+    old_timeout = wintypes.DWORD(0)
+    user32.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(old_timeout), 0)
+    user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_SENDCHANGE)
     try:
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
+        if not user32.SetForegroundWindow(hwnd):
+            logmsg("=== _bring_window_to_front: SetForegroundWindow declined for %r (window is still open, just not raised) ===", title)
     finally:
-        if attached:
-            user32.AttachThreadInput(current_thread, fg_thread, False)
+        user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, old_timeout.value, SPIF_SENDCHANGE)
 
 
 class PickerAPI:
