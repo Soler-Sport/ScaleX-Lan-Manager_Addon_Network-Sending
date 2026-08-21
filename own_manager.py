@@ -349,9 +349,13 @@ user32.SetForegroundWindow.argtypes = [wintypes.HWND]
 user32.SetForegroundWindow.restype = wintypes.BOOL
 user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
 user32.SystemParametersInfoW.restype = wintypes.BOOL
+user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
+user32.keybd_event.restype = None
 SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
 SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
 SPIF_SENDCHANGE = 0x2
+VK_MENU = 0x12          # Alt
+KEYEVENTF_KEYUP = 0x0002
 
 
 def force_window_to_foreground(qwidget):
@@ -364,21 +368,44 @@ def force_window_to_foreground(qwidget):
     pywebview build - see git history/PR #1 - it ties this thread's input
     queue to whatever process currently owns the foreground, and can freeze
     both windows if that process is even briefly busy at that exact
-    moment). Uses the standard alternative instead: briefly zero out the
-    system-wide foreground-lock timeout, call SetForegroundWindow, restore
-    it - doesn't touch any other process's thread state at all. Since this
-    is a real QWidget reference (not a window found by title via
-    FindWindowW like the pywebview version needed), it's also just
-    simpler."""
+    moment).
+
+    Zeroing the system-wide foreground-lock timeout alone (the only trick
+    this used to do) turned out NOT to be enough on its own - confirmed
+    live 2026-08-21: the log showed "SetForegroundWindow declined" on every
+    single call, and the user reported the picker always just sits in the
+    taskbar needing a manual click. The lock-timeout value only controls
+    how long Windows waits before giving up and flashing the taskbar
+    button instead of switching - modern Windows (10/11) separately checks
+    whether the calling process looks like it just received real user
+    input before honoring SetForegroundWindow from a background process at
+    all, and own_manager (reacting to a background thread's signal) never
+    does. The standard, widely-documented workaround for that second check:
+    synthesize a harmless Alt keydown/keyup via keybd_event right before
+    asking - this only feeds this process's own synthetic input queue, it
+    does NOT touch any other process/thread's state the way
+    AttachThreadInput does, so it doesn't carry the freeze risk that got
+    AttachThreadInput ruled out above."""
     hwnd = int(qwidget.winId())
     old_timeout = wintypes.DWORD(0)
     user32.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(old_timeout), 0)
-    user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_SENDCHANGE)
+    user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, 0)
     try:
-        if not user32.SetForegroundWindow(hwnd):
-            logmsg("=== force_window_to_foreground: SetForegroundWindow declined (window stays open, just not raised) ===")
+        user32.keybd_event(VK_MENU, 0, 0, None)              # Alt down
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, None)  # Alt up
+
+        if qwidget.isMinimized():
+            qwidget.showNormal()
+
+        ok = user32.SetForegroundWindow(hwnd)
+        if not ok:
+            logmsg("=== force_window_to_foreground: SetForegroundWindow declined even after the Alt-keypress trick (window stays open, just not raised) ===")
+        # Cheap Qt-level fallbacks - cost nothing, occasionally succeed even
+        # when the raw WinAPI call above is declined.
+        qwidget.raise_()
+        qwidget.activateWindow()
     finally:
-        user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, old_timeout.value, SPIF_SENDCHANGE)
+        user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, old_timeout.value, 0)
 
 # --- Your own manager (ScaleX LAN Manager, FastAPI/uvicorn) ---
 SCALEX_HOST = "192.168.0.118"
@@ -800,54 +827,73 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
 # different threads, no PostMessage/AttachThreadInput-style plumbing needed
 # the way the old WebView2-based attempts required).
 #
-# NOTE: colors below are a placeholder dark theme, NOT ScaleX's real
-# styles.css - written away from the office with no network path to fetch
-# the actual stylesheet and copy its real values (unlike the old
-# WebView2/pywebview picker, which loaded the genuine CSS live over the
-# network and so always matched exactly). Swap COLOR_* for the real
-# :root values from ScaleX's own styles.css once available; every color
-# the picker uses funnels through those constants and PICKER_QSS below.
+# Real values, copied byte-for-byte from ScaleX's own styles.css :root
+# block and its actual rules for the specific pieces this window mirrors
+# (2026-08-21, http://<scalex host>:<port>/styles.css - fetch it again and
+# diff against this block if ScaleX's theme ever changes):
+#   :root { --bg:#111315; --panel:#1a1d20; --panel-2:#22262a; --line:#31363b;
+#            --text:#f4f1ea; --muted:#999f9f; --accent:#e8ff65;
+#            --green:#73d49a; --red:#ff7e78; }
+#   input,select,textarea { background:#111416; border:1px solid var(--line); border-radius:8px; }
+#   .bulk-printer-option { background:#15181a; border-radius:9px; }  <- printer cards specifically, NOT --panel
+#   .bulk-printer-option:has(:checked) { border-color: rgba(232,255,101,.65); background: rgba(232,255,101,.06); }
+#   .bulk-printer-state.is-ready { color: var(--green); }   <- NOT --accent, ScaleX uses green for "ready"
+#   .bulk-printer-state.is-error { color: var(--red); }
+#   .operator-prepared-toggle.active { color: var(--green); border-color: rgba(115,212,154,.7); background: rgba(115,212,154,.12); }
+#   .primary { background: var(--accent); color: #12140c; font-weight:700; border-radius:9px; padding:10px 15px; }
+#   .primary:disabled { background:#25292c; color: var(--muted); }
+#   button { border:1px solid var(--line); border-radius:9px; padding:10px 15px; background: var(--panel); }
+#   font-family: "Segoe UI", Arial, sans-serif;
+# Every color the picker uses funnels through these constants and
+# PICKER_QSS below - re-derive from the real stylesheet, don't hand-tune
+# hex values here directly.
 # ---------------------------------------------------------------------------
-COLOR_BG = "#14161a"
-COLOR_PANEL = "#1c1f26"
-COLOR_PANEL_2 = "#22262e"
-COLOR_LINE = "#2c3038"
-COLOR_TEXT = "#e6e8eb"
-COLOR_TEXT_DIM = "#9aa1ab"
-COLOR_ACCENT = "#3ddc84"
-COLOR_RED = "#e5484d"
+COLOR_BG = "#111315"
+COLOR_PANEL = "#1a1d20"
+COLOR_PANEL_2 = "#22262a"
+COLOR_LINE = "#31363b"
+COLOR_TEXT = "#f4f1ea"
+COLOR_TEXT_DIM = "#999f9f"
+COLOR_ACCENT = "#e8ff65"
+COLOR_ACCENT_TEXT = "#12140c"  # text painted ON TOP of an accent-colored surface (.primary)
+COLOR_GREEN = "#73d49a"        # "ready"/"prepared" state - ScaleX does NOT reuse accent for this
+COLOR_RED = "#ff7e78"
+COLOR_CARD_BG = "#15181a"      # printer cards specifically - distinct from --panel, not a typo
+COLOR_INPUT_BG = "#111416"     # text inputs specifically - distinct from --panel, not a typo
+FONT_FAMILY = "Segoe UI"
 
 PICKER_QSS = """
+* { font-family: "%(font)s"; }
 QMainWindow, #pickerCentral, #pickerScrollContents { background: %(bg)s; }
 QLabel { color: %(text)s; }
-#eyebrowLabel { color: %(dim)s; font-size: 10px; font-weight: 600; }
+#eyebrowLabel { color: %(accent)s; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
 #headingLabel { color: %(text)s; font-size: 17px; font-weight: 700; }
 #fieldLabel { color: %(dim)s; font-size: 11.5px; }
 #machineNotice { background: %(panel2)s; color: %(accent)s; border-left: 3px solid %(accent)s;
     border-radius: 4px; padding: 8px 10px; }
 #selectedCountLabel { color: %(dim)s; font-size: 11.5px; }
-QLineEdit { background: %(panel)s; color: %(text)s; border: 1px solid %(line)s;
-    border-radius: 6px; padding: 7px 9px; }
+QLineEdit { background: %(inputbg)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: 8px; padding: 8px 10px; }
 QLineEdit:focus { border: 1px solid %(accent)s; }
 QLineEdit:disabled { color: %(dim)s; }
 QCheckBox { color: %(text)s; spacing: 6px; }
 QCheckBox:disabled { color: %(dim)s; }
 QPushButton { background: %(panel)s; color: %(text)s; border: 1px solid %(line)s;
-    border-radius: 6px; padding: 7px 14px; }
+    border-radius: 9px; padding: 9px 15px; }
 QPushButton:hover { border: 1px solid %(accent)s; }
 QPushButton:disabled { color: %(dim)s; }
-#sendBtn { background: %(accent)s; color: #06120b; font-weight: 700; border: none; }
-#sendBtn:disabled { background: %(panel2)s; color: %(dim)s; }
+#sendBtn { background: %(accent)s; color: %(accenttext)s; font-weight: 700; border: none; }
+#sendBtn:disabled { background: #25292c; color: %(dim)s; }
 QScrollArea { border: none; background: transparent; }
-#printerRow { background: %(panel)s; border: 1px solid %(line)s; border-radius: 8px; }
-#printerRow[selected="true"] { border: 1px solid %(accent)s; }
+#printerRow { background: %(cardbg)s; border: 1px solid %(line)s; border-radius: 9px; }
+#printerRow[selected="true"] { border: 1px solid rgba(232, 255, 101, .65); background: rgba(232, 255, 101, .06); }
 #printerName { color: %(text)s; font-size: 12.5px; font-weight: 700; }
 #printerMeta { color: %(dim)s; font-size: 11.5px; }
-#stateLabel[state="ready"] { color: %(accent)s; font-size: 11px; font-weight: 600; }
+#stateLabel[state="ready"] { color: %(green)s; font-size: 11px; font-weight: 600; }
 #stateLabel[state="busy"] { color: %(red)s; font-size: 11px; font-weight: 600; }
 #stateLabel[state="offline"] { color: %(dim)s; font-size: 11px; font-weight: 600; }
 #preparedBadge { font-size: 10.5px; border-radius: 4px; padding: 3px 7px; }
-#preparedBadge[prepared="true"] { color: %(accent)s; background: %(panel2)s; }
+#preparedBadge[prepared="true"] { color: %(green)s; background: rgba(115, 212, 154, .12); }
 #preparedBadge[prepared="false"] { color: %(dim)s; background: %(panel2)s; }
 #recSummary { color: %(dim)s; font-size: 11px; }
 #miniProgressLabel { color: %(dim)s; font-size: 11px; }
@@ -856,7 +902,9 @@ QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius
 QProgressBar::chunk { background: %(accent)s; border-radius: 5px; }
 """ % {
     "bg": COLOR_BG, "panel": COLOR_PANEL, "panel2": COLOR_PANEL_2, "line": COLOR_LINE,
-    "text": COLOR_TEXT, "dim": COLOR_TEXT_DIM, "accent": COLOR_ACCENT, "red": COLOR_RED,
+    "text": COLOR_TEXT, "dim": COLOR_TEXT_DIM, "accent": COLOR_ACCENT,
+    "accenttext": COLOR_ACCENT_TEXT, "green": COLOR_GREEN, "red": COLOR_RED,
+    "cardbg": COLOR_CARD_BG, "inputbg": COLOR_INPUT_BG, "font": FONT_FAMILY,
 }
 
 
@@ -1032,9 +1080,6 @@ class PrinterRowWidget(QFrame):
         self.rec_row.setVisible(has_rec)
         if has_rec:
             self.rec_summary_label.setText(summary)
-            if not self.rec_checkbox.isChecked() and self.rec_checkbox.property("_ever_shown") != "true":
-                self.rec_checkbox.setChecked(True)  # default on, first time only - matches the old page
-                self.rec_checkbox.setProperty("_ever_shown", "true")
 
         prepared = printer.get("operatorPrepared") is True
         self.prepared_badge.setText("Принтер подготовлен" if prepared else "Не подтверждён")
@@ -1198,12 +1243,12 @@ class PickerWindow(QMainWindow):
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        scroll_contents = QWidget()
-        scroll_contents.setObjectName("pickerScrollContents")
-        self.list_layout = QVBoxLayout(scroll_contents)
+        self.scroll_contents = QWidget()
+        self.scroll_contents.setObjectName("pickerScrollContents")
+        self.list_layout = QVBoxLayout(self.scroll_contents)
         self.list_layout.setSpacing(6)
         self.list_layout.addStretch(1)  # keeps rows top-aligned as they're added before this
-        self.scroll_area.setWidget(scroll_contents)
+        self.scroll_area.setWidget(self.scroll_contents)
         form.addWidget(self.scroll_area, 1)
 
         self.start_print_cb = QCheckBox("Запустить печать сразу после отправки")
@@ -1273,7 +1318,22 @@ class PickerWindow(QMainWindow):
             if pid in self.rows:
                 self.rows[pid].apply_data(p)
             else:
-                row = PrinterRowWidget(p)
+                # parent=self.scroll_contents matters here, not just as a
+                # style choice: a row created with no parent (the default)
+                # stays a genuine top-level widget until _render_list()
+                # below happens to insertWidget() it into list_layout - and
+                # that only happens for rows that pass the CURRENT filter.
+                # Most rows fail the default filters (match_only/
+                # online_only/hide_busy) on this very first load, so most
+                # rows were never inserted at all and stayed parentless -
+                # i.e. real, invisible, ever-growing top-level OS windows -
+                # for the rest of the picker's life. This was the actual
+                # majority contributor to the topLevelWidgets leak (the
+                # setParent(None) call removed elsewhere in this file was a
+                # second, smaller contributor on top of this one). Giving
+                # every row a real parent up front, before filtering ever
+                # runs, fixes it regardless of which rows are visible.
+                row = PrinterRowWidget(p, parent=self.scroll_contents)
                 row.on_selection_changed = self._update_selected_count
                 self.rows[pid] = row
 
@@ -1293,10 +1353,27 @@ class PickerWindow(QMainWindow):
         # remove everything but the trailing stretch, then re-add in sorted,
         # filtered order - cheap (repositioning, not recreating) since rows
         # are persistent widgets.
+        #
+        # IMPORTANT: only takeAt() here, never setParent(None). takeAt()
+        # detaches the widget from the LAYOUT but leaves its Qt parent
+        # (scroll_contents) untouched, which is what we want since rows not
+        # matching the current filter simply stay an un-laid-out child,
+        # invisible, still owned by scroll_contents. Calling setParent(None)
+        # on top of that clears the widget's parent entirely, which in Qt
+        # promotes it to an independent TOP-LEVEL WIDGET (a real, if
+        # invisible, OS window) instead of destroying it - since every row
+        # that fails the current filter (search text / online-only /
+        # hide-busy / match-only) is never re-inserted, it was orphaned
+        # forever as a phantom top-level window every single time
+        # _render_list() ran (every 5s printer refresh + every filter
+        # keystroke). That's what the topLevelWidgets() diagnostic dump
+        # caught: dozens of PrinterRowWidget(visible=False, size=640x480)
+        # entries (640x480 is Qt's default size for a parentless widget)
+        # accumulating without bound - explaining both the "~5 empty
+        # windows" flashes and the picker getting progressively slower to
+        # open. Fixed 2026-08-21.
         while self.list_layout.count() > 1:
-            item = self.list_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
+            self.list_layout.takeAt(0)
 
         ordered = sorted(self.rows.values(),
                           key=lambda r: (r.printer.get("displayName") or r.printer.get("name") or "").lower())
