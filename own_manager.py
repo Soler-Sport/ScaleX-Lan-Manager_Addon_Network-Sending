@@ -1491,7 +1491,24 @@ class AppController(QObject):
 controller = None  # created in main(), before any background thread starts
 
 
+# "1a / Send over grid" from the project's icon design pass (2026-08-21) -
+# a multi-resolution .ico (16/24/32/48/256, see own_manager_icon.ico) so
+# Windows can pick a crisp size for the tray, Alt-Tab, and taskbar instead
+# of scaling one flat bitmap.
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_manager_icon.ico")
+
+
 def _make_tray_icon():
+    if os.path.isfile(ICON_PATH):
+        icon = QIcon(ICON_PATH)
+        if not icon.isNull():
+            return icon
+        logmsg("=== _make_tray_icon: QIcon(%r) loaded but is null, falling back to drawn dot ===", ICON_PATH)
+    else:
+        logmsg("=== _make_tray_icon: %r not found, falling back to drawn dot ===", ICON_PATH)
+    # Fallback so a missing/corrupt icon file never stops the app from
+    # starting - just a plain accent-colored dot, same as before this icon
+    # existed.
     pm = QPixmap(32, 32)
     pm.fill(Qt.transparent)
     from PySide6.QtGui import QPainter, QBrush
@@ -1707,6 +1724,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # tray-resident: closing every picker window must not exit the app
     app.setStyleSheet(PICKER_QSS)
+    app.setWindowIcon(_make_tray_icon())  # every PickerWindow inherits this (taskbar/Alt-Tab), not just the tray
 
     controller = AppController()
     controller.file_captured.connect(open_picker_window, Qt.QueuedConnection)
