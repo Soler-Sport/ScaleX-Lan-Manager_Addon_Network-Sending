@@ -90,12 +90,13 @@ import struct
 import ctypes
 import socket
 import shutil
+import winreg
 import datetime
 import threading
+import subprocess
 import http.client
 import http.server
 import urllib.parse
-import webview
 from ctypes import wintypes
 
 try:
@@ -340,10 +341,10 @@ SW_RESTORE = 9
 
 
 def _bring_window_to_front(title, timeout=3.0):
-    """pywebview windows don't reliably grab focus on their own when a new
-    one is created while some other app is in the foreground (e.g.
-    CHITUBOX) - find it by its exact title (unique per capture, includes
-    the filename) once it's actually mapped, and force it forward. Plain
+    """A newly-launched --app window doesn't reliably grab focus on its own
+    when some other app is in the foreground (e.g. CHITUBOX) - find it by
+    its exact title (unique per capture, includes the filename) once it's
+    actually mapped, and force it forward. Plain
     SetForegroundWindow silently no-ops here (own_manager is a background
     process with no recent input focus of its own - confirmed live,
     2026-08-20: the call succeeded but the window never actually came
@@ -380,40 +381,37 @@ def _bring_window_to_front(title, timeout=3.0):
             user32.AttachThreadInput(current_thread, fg_thread, False)
 
 
-class PickerAPI:
-    """Exposed to the picker page's JS as window.pywebview.api.* - lets the
-    page ask own_manager to close its own window once a send is done,
-    without needing an address bar's tab-close control (there isn't one)."""
-    def __init__(self):
-        self.window = None
-
-    def close(self):
-        if self.window is not None:
+def find_app_mode_browser():
+    """Locate an installed Chromium browser (Edge preferred, then Chrome)
+    via the same "App Paths" registry key Windows itself uses to resolve
+    these exe names - works regardless of install location/machine."""
+    for exe in ("msedge.exe", "chrome.exe"):
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
             try:
-                self.window.destroy()
-            except Exception as e:
-                logmsg("=== PickerAPI.close FAILED: %s ===", e)
+                key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % exe)
+                path, _ = winreg.QueryValueEx(key, None)
+                if path and os.path.isfile(path):
+                    return path
+            except OSError:
+                continue
+    return None
 
+
+APP_BROWSER = find_app_mode_browser()
 
 _window_counter = 0
 _window_counter_lock = threading.Lock()
 
-# item_id -> unique window title, for the polling cleanup below. Tried
-# doing this event-driven via pywebview's win.events.closed instead - that
-# reliably froze the entire app (HTTP server included, window turned
-# unresponsive) the moment it was registered right after create_window(),
-# reproduced live 2026-08-20. Plain polling avoids pywebview's event API
-# and reuses the same FindWindowW mechanism _bring_window_to_front already
-# uses safely.
+# item_id -> unique window title, for the polling cleanup below.
 _pending_windows = {}
 _pending_windows_lock = threading.Lock()
 
 
 def _pending_cleanup_loop():
     """Runs forever: drops a PENDING entry once its picker window is gone
-    (closed via the X button or our own "Закрыть окно" - either way,
-    /api/send already popped it if it was actually sent) - see
-    _pending_windows comment above for why this is polling, not events."""
+    (closed either way - /api/send already popped it if it was actually
+    sent, so a still-present entry here means the window was closed/the
+    app-mode browser process ended without ever sending)."""
     while True:
         time.sleep(10)
         with _pending_windows_lock:
@@ -430,14 +428,16 @@ def _pending_cleanup_loop():
 
 
 def open_app_window(title, url, item_id=None):
-    """Open a real native WebView2 window (pywebview, backed by the Edge
-    WebView2 runtime) instead of a Chrome/Edge "--app" browser window - no
-    address bar to strip, no generic browser favicon in the titlebar, just
-    the app's own title text. pywebview requires at least one window to
-    exist before webview.start() is ever called (main() creates a hidden
-    1x1 sentinel for that), but once it's running, new windows can be
-    created from any thread - which is exactly what this does, once per
-    captured file."""
+    """Open url as its own app-style window (no address bar/tabs) via
+    Chrome/Edge's --app mode - a separate OS process per window, entirely
+    independent of own_manager's own process. Used in place of an earlier
+    pywebview-based native window: that gave a cleaner titlebar (no
+    generic browser favicon) but caused own_manager itself to hang or
+    silently crash more than once under real usage (large files, long
+    sends) with no diagnosable trace - a whole separate browser process
+    per window can't take the rest of own_manager down with it, which is
+    worth more than the cosmetic upgrade. Falls back to the system default
+    handler (a normal browser tab) if no Chromium browser is found."""
     global _window_counter
     with _window_counter_lock:
         _window_counter += 1
@@ -445,24 +445,27 @@ def open_app_window(title, url, item_id=None):
     # _bring_window_to_front finds the window by exact title via
     # FindWindowW - two captures of a same-named file (e.g. resending the
     # same part) would otherwise share one title, and it could grab the
-    # already-open older window instead of the new one. A handful of
-    # zero-width spaces make each window's title unique without changing
-    # what's actually visible in the titlebar.
+    # already-open older window instead of the new one. The OS window title
+    # in --app mode comes from the page's own document.title, not a launch
+    # flag, so the uniqueness tag rides along as a URL param (&wtag=N) and
+    # the page appends it as invisible zero-width spaces itself (see
+    # PAGE_HTML's init()) - what's actually visible never changes.
     unique_title = title + (chr(0x200B) * n)
-    try:
-        api = PickerAPI()
-        win = webview.create_window(
-            unique_title, url, js_api=api,
-            width=880, height=907, min_size=(560, 480), resizable=True,
-        )
-        api.window = win
-        if item_id:
-            with _pending_windows_lock:
-                _pending_windows[item_id] = unique_title
-        threading.Thread(target=_bring_window_to_front, args=(unique_title,), daemon=True).start()
-    except Exception as e:
-        logmsg("=== open_app_window: webview.create_window failed (%s), falling back to os.startfile ===", e)
-        os.startfile(url)
+    tagged_url = url + ("&" if "?" in url else "?") + "wtag=%d" % n
+    if item_id:
+        with _pending_windows_lock:
+            _pending_windows[item_id] = unique_title
+    if APP_BROWSER:
+        try:
+            subprocess.Popen([
+                APP_BROWSER, "--app=%s" % tagged_url,
+                "--window-size=880,907", "--window-position=200,80",
+            ])
+            threading.Thread(target=_bring_window_to_front, args=(unique_title,), daemon=True).start()
+            return
+        except Exception as e:
+            logmsg("=== open_app_window: launching %s failed (%s), falling back ===", APP_BROWSER, e)
+    os.startfile(url)
 
 # --- Your own manager (ScaleX LAN Manager, FastAPI/uvicorn) ---
 SCALEX_HOST = "192.168.0.118"
@@ -668,17 +671,25 @@ def build_recommendation_patch(printer):
     return patch
 
 
-def patch_and_upload_single(draft_id, printer_id, patch, auto_start):
-    """POST /api/ctb/patch-and-upload {printerId, draftId, patch, autoStart}.
+def patch_and_upload_single(draft_id, printer_id, patch, auto_start, patch_mode="fast"):
+    """POST /api/ctb/patch-and-upload {printerId, draftId, patch, patchMode, autoStart}.
     Single-printer only - it's the only ScaleX endpoint that actually starts
     a print (X-Start-Print/autoStart isn't honoured by the bulk endpoints at
     all, confirmed in app.js), so a multi-printer "start print" send loops
-    this call once per target printer."""
+    this call once per target printer.
+    patch_mode: "fast" (default, matches ScaleX's own default) just patches
+    the CTB header fields directly - fails on files whose draft came back
+    with parameters.fastPatchSupported === false. "full" instead rebuilds
+    the whole file through UVTools - always works, but the ~1 minute
+    "temporary copy" cost mentioned elsewhere in this file applies to it
+    specifically, not to "fast" (confirmed in app.js: only patchMode "full"
+    shows the "may take about a minute" confirm() in ScaleX's own UI)."""
     conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=1800)
     try:
         body = json.dumps({
-            "printerId": printer_id, "draftId": draft_id,
-            "patch": patch, "autoStart": bool(auto_start),
+            "printerId": printer_id, "draftId": draft_id, "patch": patch,
+            "patchMode": "full" if patch_mode == "full" else "fast",
+            "autoStart": bool(auto_start),
         }).encode("utf-8")
         conn.request("POST", "/api/ctb/patch-and-upload", body=body,
                       headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
@@ -796,13 +807,17 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, item_
         progress_cb(True, True, None, "Тайм-аут ожидания статуса")
 
 
-def send_in_background(file_path, targets, display_name=None, start_print=False, item_id=None):
+def send_in_background(file_path, targets, display_name=None, start_print=False, item_id=None, patch_mode="fast"):
     """targets: list of {"printerId": id, "applyRecommendations": bool}.
     display_name: filename to present to ScaleX (defaults to the file's own
     name on disk) - lets the picker page rename the file before sending,
     same idea as ChituManager's own editable filename field.
     start_print: whether to actually start printing once each transfer
     lands (X-Start-Print / autoStart).
+    patch_mode: "fast" (header-only edit) or "full" (full UVTools rebuild)
+    - only matters for printers that actually get a recommendations patch;
+    same toggle ScaleX's own single-printer upload modal exposes, ours
+    just applies it farm-wide for this one send instead of per click.
 
     ALWAYS dispatches per-printer, in parallel, through the same
     single-printer endpoints ScaleX's own normal upload UI uses
@@ -821,15 +836,19 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
     name = display_name or os.path.basename(file_path)
 
     def _run():
-        # The CTB draft/patch-and-upload endpoint always makes a temporary
+        # The CTB draft/patch-and-upload endpoint makes a temporary
         # rewritten copy of the file server-side before sending it - fine
         # when a printer's exposure/layer settings actually need patching,
-        # wasteful (~1min, confirmed by ScaleX's own confirm() prompt for
-        # this exact endpoint) when the timings in the file are already
-        # correct. ScaleX's own upload UI only goes through that path when
-        # there's an actual patch selected - otherwise it just streams the
-        # file as-is. Mirrors that here: only fetch a draftId, and only for
-        # printers that end up needing one.
+        # wasteful when the timings are already correct. ScaleX's own
+        # upload UI only goes through that path when there's an actual
+        # patch selected - otherwise it just streams the file as-is.
+        # Mirrors that here: only fetch a draftId, and only for printers
+        # that end up needing one. Within that, patchMode picks *how* the
+        # rewrite happens: "fast" just edits the CTB header fields
+        # in-place; "full" rebuilds the whole file through UVTools instead
+        # (always works, but that's the one that's actually slow - ~1min,
+        # confirmed by ScaleX's own confirm() prompt, which only fires for
+        # "full" - "fast" has no such warning in their UI).
         #
         # Targets are dispatched to ScaleX *concurrently*, not one at a time
         # - ScaleX's own manager already queues/throttles transfers to each
@@ -889,9 +908,9 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             patch = build_recommendation_patch(printer) if (t.get("applyRecommendations") and has_recommendations(printer)) else {}
             try:
                 if patch:
-                    status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, start_print)
-                    logmsg("=== PATCH+UPLOAD (startPrint=%s) -> %s: HTTP %d: %s ===",
-                           start_print, pid, status, resp_body[:400].decode("utf-8", "replace"))
+                    status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, start_print, patch_mode=patch_mode)
+                    logmsg("=== PATCH+UPLOAD (startPrint=%s, patchMode=%s) -> %s: HTTP %d: %s ===",
+                           start_print, patch_mode, pid, status, resp_body[:400].decode("utf-8", "replace"))
                 else:
                     # Timings already fine for this printer (or no
                     # recommendations to apply) - skip the rewrite, send
@@ -1062,6 +1081,10 @@ PAGE_HTML = """<!doctype html>
 <script>
 const params = new URLSearchParams(location.search);
 let pendingId = params.get('id');
+// Invisible uniqueness tag own_manager appends to the URL (&wtag=N) so it
+// can tell same-titled windows apart via FindWindowW - zero-width spaces
+// don't change what's actually visible in the titlebar.
+const windowTag = String.fromCharCode(0x200B).repeat(Number(params.get('wtag')) || 0);
 let printers = [];
 let detectedMachine = null;  // CTB's own embedded target-machine name, if found
 
@@ -1249,11 +1272,9 @@ function setMiniProgress(opt, phase, percent, message) {
 }
 
 function closeWindow() {
-  if (window.pywebview && window.pywebview.api && window.pywebview.api.close) {
-    window.pywebview.api.close();
-  } else {
-    window.close();  // e.g. opened in a plain browser tab instead of the native window
-  }
+  // Works because this page was opened via --app mode as its own window -
+  // a script is allowed to close a window it's the only/top-level page of.
+  window.close();
 }
 
 document.getElementById('closeWindowBtn').addEventListener('click', closeWindow);
@@ -1348,7 +1369,7 @@ async function refreshPrinters() {
 async function loadPrintersAndShowForm(filename, machineName) {
   printers = await (await fetch('/api/printers')).json();
   printers.sort((a, b) => (a.displayName || a.name || '').localeCompare(b.displayName || b.name || ''));
-  document.title = 'Network sending \u2014 ' + filename;
+  document.title = 'Network sending \u2014 ' + filename + windowTag;
   document.getElementById('filenameInput').value = filename;
   document.getElementById('loadingNotice').style.display = 'none';
   document.getElementById('uploadZone').style.display = 'none';
@@ -1557,10 +1578,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if src_ext and not display_name.lower().endswith(src_ext.lower()):
                 display_name += src_ext
             start_print = bool(data.get("startPrint"))
-            logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s) ===",
-                   item["filename"], display_name, json.dumps(targets), start_print)
+            patch_mode = "full" if data.get("patchMode") == "full" else "fast"
+            logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s, patchMode=%s) ===",
+                   item["filename"], display_name, json.dumps(targets), start_print, patch_mode)
             send_in_background(item["file_path"], targets, display_name=display_name,
-                                start_print=start_print, item_id=item_id)
+                                start_print=start_print, item_id=item_id, patch_mode=patch_mode)
             self._send_json(200, {"ok": True})
             return
 
@@ -1783,23 +1805,12 @@ def main():
         print("FAILED to create shared memory segment - see log. Exiting.")
         return 1
 
-    # CHITUBOX only ever opens one persistent connection - handling it in a
-    # background thread frees up the main thread for pywebview, which
-    # insists on owning it (webview.start() below blocks here forever).
-    threading.Thread(target=_chitubox_accept_loop, args=(listen_sock,), daemon=True).start()
-
-    # pywebview needs at least one window to exist before start() - this
-    # tiny hidden one just keeps its event loop alive; real picker windows
-    # get created on demand by open_app_window() from any thread once
-    # start() is running.
-    webview.create_window("own_manager", "about:blank", hidden=True, width=1, height=1)
-
     print("own_manager running. Log: %s" % LOG_PATH)
     print("Picker UI: http://127.0.0.1:%d/  (opens automatically on each capture)" % HTTP_PORT)
-    print("Close this window / Ctrl+C to stop (CHITUBOX will fall back to launching the real ChituManager).")
+    print("Ctrl+C to stop (CHITUBOX will fall back to launching the real ChituManager).")
 
     try:
-        webview.start(debug=False)
+        _chitubox_accept_loop(listen_sock)
     except KeyboardInterrupt:
         pass
     finally:
