@@ -1466,12 +1466,32 @@ class PickerWindow(QMainWindow):
 _open_windows = []  # keeps PickerWindow instances alive - Qt doesn't hold a Python reference on its own
 
 
+_TRAILING_HEX_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$", re.IGNORECASE)
+
+
+def _clean_display_filename(filename):
+    """Both capture paths tack a random 8-hex-char suffix onto the slice
+    name for on-disk uniqueness only - handle_client()'s own SaveFile
+    request names PENDING files "<label>_<uuid4 hex[:8]>.ctb" so re-sending
+    the same job twice can't collide, and slicer_file_watcher()'s files
+    (named by ChituManager itself, not us) carry the same kind of suffix.
+    Necessary on disk, meaningless clutter in the picker's editable
+    filename field/window title, and - if the user never bothers to rename
+    it - in what actually gets sent to ScaleX as the file name. Strip it
+    for display/default purposes only; the real file on disk (and
+    self.file_path, which is what's actually uploaded) keeps its unique
+    name regardless."""
+    stem, ext = os.path.splitext(filename)
+    cleaned = _TRAILING_HEX_SUFFIX_RE.sub("", stem)
+    return (cleaned or stem) + ext
+
+
 def open_picker_window(dest_path):
     """Slot for AppController.file_captured - runs on the GUI thread (the
     signal/slot connection below is queued whenever the emitting thread
     differs from this one, e.g. handle_client()'s background thread), so
     it's safe to create Qt widgets here."""
-    filename = os.path.basename(dest_path)
+    filename = _clean_display_filename(os.path.basename(dest_path))
     machine_name = extract_ctb_machine_name(dest_path)
     logmsg("=== OPENING PICKER: %s (machine=%r) ===", filename, machine_name)
     win = PickerWindow(dest_path, filename, machine_name)
@@ -1720,6 +1740,21 @@ def main():
 
     logmsg("=== own_manager started PID=%d ===", os.getpid())
     logmsg("=== ScaleX: http://%s:%d ===", SCALEX_HOST, SCALEX_PORT)
+
+    # Without this, Windows' taskbar groups every pythonw.exe-hosted window
+    # under Python's own generic app identity, and the taskbar BUTTON
+    # specifically (unlike the title bar/Alt-Tab icon, which honors Qt's
+    # WM_SETICON fine either way) falls back to pythonw.exe's own default
+    # icon instead of the one set below via app.setWindowIcon() - confirmed
+    # live 2026-08-21 (tray icon correct, picker window's taskbar button
+    # still default). Giving the process its own AppUserModelID, before any
+    # window exists, is the standard fix - decouples it from the shared
+    # "Python" taskbar identity entirely. Must be set before QApplication()
+    # creates the first window.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SolerSport.OwnManager.NetworkSending")
+    except Exception as e:
+        logmsg("=== SetCurrentProcessExplicitAppUserModelID FAILED (taskbar icon may show default): %s ===", e)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # tray-resident: closing every picker window must not exit the app
