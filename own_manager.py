@@ -1,12 +1,14 @@
 """
 own_manager.py - forwards every file CHITUBOX sends over "Network Sending"
-to one or more printers on your own ScaleX LAN Manager farm. A real web
-page (own_manager's own local HTTP server, styled with ScaleX's own
-styles.css so it looks like part of the same app) pops up in the browser
-for each captured file, letting you rename it, pick printers (checkboxes),
-and apply each printer's own recommended exposure settings.
+to one or more printers on your own ScaleX LAN Manager farm. A native Qt
+(PySide6) window pops up for each captured file, letting you rename it,
+pick printers (checkboxes), and apply each printer's own recommended
+exposure settings - with a tray icon so it's clear it's running and easy to
+exit from there.
 
-Run: python own_manager.py   (keep the console window open)
+Run: python own_manager.py
+Requires: PySide6 (pip install PySide6), pycryptodome (optional, see
+extract_ctb_machine_name).
 Log: C:\\own_manager\\own_manager.log
 
 ============================================================================
@@ -34,11 +36,22 @@ Pro.exe's own ChituManager::saveSliceFile / ChituManager::saveSlicerFileOver,
 2026-08-19) - own_manager asks for this the moment CHITUBOX says it's ready
 (its "LoadWindow" ping) and, once the file lands, opens the picker page.
 
-The picker UI first used tkinter (a native popup); this version replaces
-that with a small page served by own_manager's own HTTP server, reusing
-ScaleX's real stylesheet (http://<scalex host>/styles.css) and its own
-CSS class names (.bulk-printer-option etc.) so it looks like a real part
-of the same app instead of a generic desktop dialog.
+The picker UI has gone through three approaches now, in order: (1) tkinter
+(a plain native popup); (2) a page served by own_manager's own local HTTP
+server, reusing ScaleX's real stylesheet live over the network
+(http://<scalex host>/styles.css) so it looked like a genuine part of the
+same app - worked well visually, but needed an embedded browser (pywebview,
+backed by the WebView2 runtime) to host it, and that embedded-browser layer
+was the direct cause of two real production freezes (cross-thread WebView2
+calls, then AttachThreadInput for window focus - see git history/PR #1 for
+the second one). This version (3) drops the browser entirely: native Qt
+(PySide6) widgets, styled via QSS instead of the real CSS (QSS is a
+different, more limited language - can't just reuse styles.css as-is; see
+COLOR_*/PICKER_QSS below, currently a placeholder dark theme written
+without network access to copy ScaleX's actual colors). One process, no
+multi-process browser engine, and progress reporting goes straight from a
+background thread to the GUI via Qt signals (auto-thread-marshaled) instead
+of a polling HTTP API.
 
 ============================================================================
 ScaleX upload contracts (reverse-engineered from its own app.js + live
@@ -93,10 +106,16 @@ import shutil
 import datetime
 import threading
 import http.client
-import http.server
 import urllib.parse
-import webview
 from ctypes import wintypes
+
+from PySide6.QtCore import Qt, QObject, Signal, QTimer
+from PySide6.QtGui import QIcon, QPixmap, QColor, QAction, QCursor
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QLineEdit, QCheckBox, QPushButton, QScrollArea, QProgressBar,
+    QSystemTrayIcon, QMenu, QFileDialog, QSizePolicy, QFrame, QMessageBox,
+)
 
 try:
     from Crypto.Cipher import AES  # pip install pycryptodome - see extract_ctb_machine_name
@@ -326,143 +345,67 @@ def create_shared_memory(name, port_str):
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
-user32.FindWindowW.restype = wintypes.HWND
-user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, wintypes.LPDWORD]
-user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
-user32.BringWindowToTop.argtypes = [wintypes.HWND]
-kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-SW_RESTORE = 9
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
+user32.SystemParametersInfoW.restype = wintypes.BOOL
+user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
+user32.keybd_event.restype = None
+SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+SPIF_SENDCHANGE = 0x2
+VK_MENU = 0x12          # Alt
+KEYEVENTF_KEYUP = 0x0002
 
 
-def _bring_window_to_front(title, timeout=3.0):
-    """pywebview windows don't reliably grab focus on their own when a new
-    one is created while some other app is in the foreground (e.g.
-    CHITUBOX) - find it by its exact title (unique per capture, includes
-    the filename) once it's actually mapped, and force it forward. Plain
-    SetForegroundWindow silently no-ops here (own_manager is a background
-    process with no recent input focus of its own - confirmed live,
-    2026-08-20: the call succeeded but the window never actually came
-    forward) - Windows only allows it unconditionally for a thread that
-    already owns the foreground, so this borrows that via
-    AttachThreadInput first (the standard workaround for exactly this)."""
-    deadline = time.monotonic() + timeout
-    hwnd = None
-    while time.monotonic() < deadline:
-        hwnd = user32.FindWindowW(None, title)
-        if hwnd:
-            break
-        time.sleep(0.05)
-    if not hwnd:
-        logmsg("=== _bring_window_to_front: window %r never appeared ===", title)
-        return
+def force_window_to_foreground(qwidget):
+    """A native Qt window created (indirectly, via a queued signal - see
+    AppController below) while some other app is in the foreground - e.g.
+    CHITUBOX, right after the "Отправка по сети" click - doesn't reliably
+    grab focus on its own either; same underlying Windows restriction that
+    made the old pywebview version need a trick here too. Does NOT use
+    AttachThreadInput (an earlier version of this trick did, for the
+    pywebview build - see git history/PR #1 - it ties this thread's input
+    queue to whatever process currently owns the foreground, and can freeze
+    both windows if that process is even briefly busy at that exact
+    moment).
 
-    # Standard workaround: borrow the current foreground thread's input
-    # state onto this thread so Windows lets it call SetForegroundWindow
-    # unconditionally, then drop it again.
-    fg_hwnd = user32.GetForegroundWindow()
-    fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
-    current_thread = kernel32.GetCurrentThreadId()
-
-    attached = False
-    if fg_thread and fg_thread != current_thread:
-        attached = bool(user32.AttachThreadInput(current_thread, fg_thread, True))
+    Zeroing the system-wide foreground-lock timeout alone (the only trick
+    this used to do) turned out NOT to be enough on its own - confirmed
+    live 2026-08-21: the log showed "SetForegroundWindow declined" on every
+    single call, and the user reported the picker always just sits in the
+    taskbar needing a manual click. The lock-timeout value only controls
+    how long Windows waits before giving up and flashing the taskbar
+    button instead of switching - modern Windows (10/11) separately checks
+    whether the calling process looks like it just received real user
+    input before honoring SetForegroundWindow from a background process at
+    all, and own_manager (reacting to a background thread's signal) never
+    does. The standard, widely-documented workaround for that second check:
+    synthesize a harmless Alt keydown/keyup via keybd_event right before
+    asking - this only feeds this process's own synthetic input queue, it
+    does NOT touch any other process/thread's state the way
+    AttachThreadInput does, so it doesn't carry the freeze risk that got
+    AttachThreadInput ruled out above."""
+    hwnd = int(qwidget.winId())
+    old_timeout = wintypes.DWORD(0)
+    user32.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(old_timeout), 0)
+    user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, 0)
     try:
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
+        user32.keybd_event(VK_MENU, 0, 0, None)              # Alt down
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, None)  # Alt up
+
+        if qwidget.isMinimized():
+            qwidget.showNormal()
+
+        ok = user32.SetForegroundWindow(hwnd)
+        if not ok:
+            logmsg("=== force_window_to_foreground: SetForegroundWindow declined even after the Alt-keypress trick (window stays open, just not raised) ===")
+        # Cheap Qt-level fallbacks - cost nothing, occasionally succeed even
+        # when the raw WinAPI call above is declined.
+        qwidget.raise_()
+        qwidget.activateWindow()
     finally:
-        if attached:
-            user32.AttachThreadInput(current_thread, fg_thread, False)
-
-
-class PickerAPI:
-    """Exposed to the picker page's JS as window.pywebview.api.* - lets the
-    page ask own_manager to close its own window once a send is done,
-    without needing an address bar's tab-close control (there isn't one)."""
-    def __init__(self):
-        self.window = None
-
-    def close(self):
-        if self.window is not None:
-            try:
-                self.window.destroy()
-            except Exception as e:
-                logmsg("=== PickerAPI.close FAILED: %s ===", e)
-
-
-_window_counter = 0
-_window_counter_lock = threading.Lock()
-
-# item_id -> unique window title, for the polling cleanup below. Tried
-# doing this event-driven via pywebview's win.events.closed instead - that
-# reliably froze the entire app (HTTP server included, window turned
-# unresponsive) the moment it was registered right after create_window(),
-# reproduced live 2026-08-20. Plain polling avoids pywebview's event API
-# and reuses the same FindWindowW mechanism _bring_window_to_front already
-# uses safely.
-_pending_windows = {}
-_pending_windows_lock = threading.Lock()
-
-
-def _pending_cleanup_loop():
-    """Runs forever: drops a PENDING entry once its picker window is gone
-    (closed via the X button or our own "Закрыть окно" - either way,
-    /api/send already popped it if it was actually sent) - see
-    _pending_windows comment above for why this is polling, not events."""
-    while True:
-        time.sleep(10)
-        with _pending_windows_lock:
-            items = list(_pending_windows.items())
-        for item_id, title in items:
-            if user32.FindWindowW(None, title):
-                continue  # still open
-            with _pending_windows_lock:
-                _pending_windows.pop(item_id, None)
-            with PENDING_LOCK:
-                item = PENDING.pop(item_id, None)
-            if item:
-                logmsg("=== picker window closed without sending, dropped pending entry for %s ===", item["filename"])
-
-
-def open_app_window(title, url, item_id=None):
-    """Open a real native WebView2 window (pywebview, backed by the Edge
-    WebView2 runtime) instead of a Chrome/Edge "--app" browser window - no
-    address bar to strip, no generic browser favicon in the titlebar, just
-    the app's own title text. pywebview requires at least one window to
-    exist before webview.start() is ever called (main() creates a hidden
-    1x1 sentinel for that), but once it's running, new windows can be
-    created from any thread - which is exactly what this does, once per
-    captured file."""
-    global _window_counter
-    with _window_counter_lock:
-        _window_counter += 1
-        n = _window_counter
-    # _bring_window_to_front finds the window by exact title via
-    # FindWindowW - two captures of a same-named file (e.g. resending the
-    # same part) would otherwise share one title, and it could grab the
-    # already-open older window instead of the new one. A handful of
-    # zero-width spaces make each window's title unique without changing
-    # what's actually visible in the titlebar.
-    unique_title = title + (chr(0x200B) * n)
-    try:
-        api = PickerAPI()
-        win = webview.create_window(
-            unique_title, url, js_api=api,
-            width=880, height=907, min_size=(560, 480), resizable=True,
-        )
-        api.window = win
-        if item_id:
-            with _pending_windows_lock:
-                _pending_windows[item_id] = unique_title
-        threading.Thread(target=_bring_window_to_front, args=(unique_title,), daemon=True).start()
-    except Exception as e:
-        logmsg("=== open_app_window: webview.create_window failed (%s), falling back to os.startfile ===", e)
-        os.startfile(url)
+        user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, old_timeout.value, 0)
 
 # --- Your own manager (ScaleX LAN Manager, FastAPI/uvicorn) ---
 SCALEX_HOST = "192.168.0.118"
@@ -497,29 +440,6 @@ def fetch_printers():
         return json.loads(body.decode("utf-8", "replace"))
     finally:
         conn.close()
-
-
-SEND_STATUS = {}  # item_id -> {"phase": ..., "percent": ..., "message": ...} - for the picker's progress bar
-SEND_STATUS_LOCK = threading.Lock()
-
-
-def _set_send_status(item_id, phase, percent=None, message="", targets=None):
-    """targets (optional): [{"printerId", "label", "phase", "percent"}, ...]
-    - lets the picker page draw one progress bar per printer instead of a
-    single generic one. If this call doesn't carry a targets list, the
-    previously published one (if any) is kept, so callers that only update
-    the overall phase/percent don't have to also resend it every time."""
-    if not item_id:
-        return
-    with SEND_STATUS_LOCK:
-        entry = {"phase": phase, "percent": percent, "message": message}
-        if targets is not None:
-            entry["targets"] = targets
-        else:
-            prev = SEND_STATUS.get(item_id)
-            if prev and "targets" in prev:
-                entry["targets"] = prev["targets"]
-        SEND_STATUS[item_id] = entry
 
 
 def _progress_from_status(status):
@@ -705,43 +625,13 @@ def forward_to_scalex_with_recommendations(file_path, targets, display_name=None
     return status, resp_body
 
 
-def _bulk_targets_to_picker_targets(status, printers_by_id):
-    """ScaleX's /api/bulk-uploads/{id} status has its own "targets" list,
-    one entry per printer, each with its own state/percent (confirmed
-    live). Reshape that into what the picker page's per-printer progress
-    bars expect."""
-    raw = status.get("targets")
-    if not isinstance(raw, list) or printers_by_id is None:
-        return None
-    out = []
-    for t in raw:
-        pid = t.get("printerId")
-        printer = printers_by_id.get(str(pid), {})
-        label = printer.get("displayName") or printer.get("name") or str(pid)
-        state = str(t.get("state") or t.get("stage") or "")
-        phase = "error" if state in ("error", "cancelled") else ("done" if state == "completed" else "sending")
-        try:
-            percent = float(t.get("percent")) if t.get("percent") is not None else None
-        except Exception:
-            percent = None
-        out.append({"printerId": pid, "label": label, "phase": phase, "percent": percent})
-    return out
-
-
-def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, item_id=None,
-                        percent_base=0.0, percent_span=100.0, progress_cb=None, printers_by_id=None):
+def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progress_cb=None):
     """Generic poller for GET {path} - works for both /api/uploads/{id} and
     /api/bulk-uploads/{id} as long as the response has a "done" bool.
-    If item_id is given, also feeds the picker page's progress bar via
-    SEND_STATUS directly - percent_base/percent_span let a caller looping
-    over several printers *sequentially* map this one job's 0-100% onto its
-    own slice of the overall bar. printers_by_id (optional) lets it also
-    publish a per-printer breakdown for /api/bulk-uploads/{id} jobs (see
-    _bulk_targets_to_picker_targets).
-    If progress_cb is given instead (or as well), it's called on every tick
-    as progress_cb(is_terminal, is_error, job_percent_0_100_or_None,
-    message) - lets a caller polling several printers *concurrently*
-    aggregate them itself instead of fighting over one SEND_STATUS entry."""
+    progress_cb, if given, is called on every tick as
+    progress_cb(is_terminal, is_error, job_percent_0_100_or_None, message) -
+    lets a caller polling several printers concurrently (see
+    send_in_background) aggregate them itself and report to its own GUI."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=15)
@@ -751,8 +641,6 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, item_
             body = resp.read()
         except Exception as e:
             logmsg("=== upload status check failed for %s (%s): %s ===", filename, path, e)
-            if item_id:
-                _set_send_status(item_id, "error", None, "Не удалось получить статус: %s" % e)
             if progress_cb:
                 progress_cb(True, True, None, "Не удалось получить статус: %s" % e)
             return
@@ -762,8 +650,6 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, item_
             status = json.loads(body.decode("utf-8", "replace"))
         except Exception:
             logmsg("=== upload status for %s: non-JSON response, giving up polling ===", filename)
-            if item_id:
-                _set_send_status(item_id, "done", 100, "")
             if progress_cb:
                 progress_cb(True, False, 100.0, "")
             return
@@ -778,11 +664,6 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, item_
         job_percent, message = _progress_from_status(status)
         if job_percent is None:
             job_percent = 100.0 if (is_terminal and not is_error) else None
-        if item_id:
-            overall = None if job_percent is None else percent_base + (job_percent / 100.0) * percent_span
-            targets_out = _bulk_targets_to_picker_targets(status, printers_by_id)
-            _set_send_status(item_id, "error" if is_error else ("done" if is_terminal else "sending"),
-                              overall, message, targets=targets_out)
         if progress_cb:
             progress_cb(is_terminal, is_error, job_percent, message)
         if is_terminal:
@@ -790,13 +671,11 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, item_
             return
         time.sleep(interval_sec)
     logmsg("=== upload status poll timed out for %s ===", filename)
-    if item_id:
-        _set_send_status(item_id, "error", None, "Тайм-аут ожидания статуса")
     if progress_cb:
         progress_cb(True, True, None, "Тайм-аут ожидания статуса")
 
 
-def send_in_background(file_path, targets, display_name=None, start_print=False, item_id=None):
+def send_in_background(file_path, targets, display_name=None, start_print=False, report_cb=None):
     """targets: list of {"printerId": id, "applyRecommendations": bool}.
     display_name: filename to present to ScaleX (defaults to the file's own
     name on disk) - lets the picker page rename the file before sending,
@@ -816,8 +695,12 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
     single-printer path is well-established (it's the literal mechanism
     ScaleX's own upload modal uses for its "start printing" checkbox), so
     that's the only path this uses now, for both start_print states.
-    item_id: if given, progress is published to SEND_STATUS[item_id] for the
-    picker page's progress bar (GET /api/send-status)."""
+    report_cb, if given, is called from a background thread as
+    report_cb(phase, percent, targets) whenever the aggregate/per-printer
+    progress changes - targets is [{"printerId","label","phase","percent"}, ...].
+    Callers with a Qt GUI should have report_cb emit a Signal rather than
+    touch widgets directly (this runs on a worker thread, not the GUI
+    thread) - see PickerWindow._on_send_clicked."""
     name = display_name or os.path.basename(file_path)
 
     def _run():
@@ -836,7 +719,8 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
         # printer itself, own_manager doesn't need to serialize on top of
         # that (that just makes a multi-printer send take N times longer
         # than it needs to for no reason).
-        _set_send_status(item_id, "uploading", 5, "Готовим файл…")
+        if report_cb:
+            report_cb("uploading", 5, [])
         try:
             printers_by_id = {str(p.get("id")): p for p in fetch_printers()}
         except Exception as e:
@@ -869,7 +753,8 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             phase = "error" if (all_done and any_error) else ("done" if all_done else "sending")
             targets_out = [{"printerId": pid, "label": v["label"], "phase": v["phase"], "percent": v["percent"]}
                            for pid, v in items]
-            _set_send_status(item_id, phase, percent, "", targets=targets_out)
+            if report_cb:
+                report_cb(phase, percent, targets_out)
 
         def _send_one(t):
             pid = t["printerId"]
@@ -933,664 +818,718 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
 
 
 # ---------------------------------------------------------------------------
-# Pending files waiting for a printer choice, and the HTTP server that
-# serves the picker page + its small API.
+# Picker GUI - native Qt widgets (PySide6), styled via QSS below to look like
+# a dashboard panel instead of a generic OS dialog. Replaces the old
+# pywebview + local-HTTP-server + PAGE_HTML approach entirely: no browser
+# engine, no HTTP server, no polling - printer/send progress goes straight
+# from a worker thread to the GUI thread via Qt signals (thread-safe by
+# construction: Qt auto-queues delivery when emitter and receiver live on
+# different threads, no PostMessage/AttachThreadInput-style plumbing needed
+# the way the old WebView2-based attempts required).
+#
+# Real values, copied byte-for-byte from ScaleX's own styles.css :root
+# block and its actual rules for the specific pieces this window mirrors
+# (2026-08-21, http://<scalex host>:<port>/styles.css - fetch it again and
+# diff against this block if ScaleX's theme ever changes):
+#   :root { --bg:#111315; --panel:#1a1d20; --panel-2:#22262a; --line:#31363b;
+#            --text:#f4f1ea; --muted:#999f9f; --accent:#e8ff65;
+#            --green:#73d49a; --red:#ff7e78; }
+#   input,select,textarea { background:#111416; border:1px solid var(--line); border-radius:8px; }
+#   .bulk-printer-option { background:#15181a; border-radius:9px; }  <- printer cards specifically, NOT --panel
+#   .bulk-printer-option:has(:checked) { border-color: rgba(232,255,101,.65); background: rgba(232,255,101,.06); }
+#   .bulk-printer-state.is-ready { color: var(--green); }   <- NOT --accent, ScaleX uses green for "ready"
+#   .bulk-printer-state.is-error { color: var(--red); }
+#   .operator-prepared-toggle.active { color: var(--green); border-color: rgba(115,212,154,.7); background: rgba(115,212,154,.12); }
+#   .primary { background: var(--accent); color: #12140c; font-weight:700; border-radius:9px; padding:10px 15px; }
+#   .primary:disabled { background:#25292c; color: var(--muted); }
+#   button { border:1px solid var(--line); border-radius:9px; padding:10px 15px; background: var(--panel); }
+#   font-family: "Segoe UI", Arial, sans-serif;
+# Every color the picker uses funnels through these constants and
+# PICKER_QSS below - re-derive from the real stylesheet, don't hand-tune
+# hex values here directly.
 # ---------------------------------------------------------------------------
-PENDING = {}  # id -> {"file_path": str, "filename": str}
-PENDING_LOCK = threading.Lock()
-FIXED_HTTP_PORT = 8917  # stable, so you can bookmark/pin http://127.0.0.1:8917/
-HTTP_PORT = 0  # filled in by start_http_server()
-MANUAL_DIR = os.path.join(ROOT_DIR, "manual")  # files picked by hand, e.g. from CHITUBOX's own Save
+COLOR_BG = "#111315"
+COLOR_PANEL = "#1a1d20"
+COLOR_PANEL_2 = "#22262a"
+COLOR_LINE = "#31363b"
+COLOR_TEXT = "#f4f1ea"
+COLOR_TEXT_DIM = "#999f9f"
+COLOR_ACCENT = "#e8ff65"
+COLOR_ACCENT_TEXT = "#12140c"  # text painted ON TOP of an accent-colored surface (.primary)
+COLOR_GREEN = "#73d49a"        # "ready"/"prepared" state - ScaleX does NOT reuse accent for this
+COLOR_RED = "#ff7e78"
+COLOR_CARD_BG = "#15181a"      # printer cards specifically - distinct from --panel, not a typo
+COLOR_INPUT_BG = "#111416"     # text inputs specifically - distinct from --panel, not a typo
+FONT_FAMILY = "Segoe UI"
 
-PAGE_HTML = """<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<title>Network sending \u2014 \u043a\u0443\u0434\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0444\u0430\u0439\u043b?</title>
-<link rel="stylesheet" href="http://__SCALEX_HOST__:__SCALEX_PORT__/styles.css">
-<style>
-  /* ScaleX's own body background is a radial-gradient glow anchored near
-     the top-right corner - subtle across their full dashboard, but this
-     window is short/narrow enough that empty space below the card makes
-     it read as a stray green smudge instead. Flat background here. */
-  /* The list of printers is the only part that should ever need to
-     scroll - the filename/search/filters above and the start-print
-     checkbox + Send button below stay put and always visible, no matter
-     how many printers are showing or how short the window is (was
-     getting clipped at a fixed window height before: as more UI got added
-     - machine notice, always-on prepared badges, etc - the fixed height
-     that used to just barely fit stopped being enough, and would keep not
-     being enough forever). */
-  html, body { height: 100%; margin: 0; }
-  body { display: flex; flex-direction: column; padding: 16px 20px 24px; font-size: 13px; background: var(--bg); }
-  .card { max-width: 840px; margin: 0 auto; width: 100%; flex: 1; min-height: 0; display: flex; flex-direction: column; }
-  .card h1 { font-size: 17px; margin-bottom: 2px; }
-  .card .eyebrow { font-size: 10px; }
-  .card label { margin: 8px 0; font-size: 12px; }
-  .card input, .card select { padding: 8px 10px; margin-top: 4px; font-size: 13px; }
-  #form { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-  .toolbar-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 8px 0 8px; flex: 0 0 auto; }
-  .filters-row { display: flex; align-items: center; gap: 10px; }
-  #viewFiltersRow { margin: 6px 0 4px; flex: 0 0 auto; }
-  #printerList {
-    /* align-items:stretch makes two cards *in the same row* match each
-       other's height when one has more content (a rec-row/badge the other
-       doesn't); align-content:start is the other half of that - without
-       it, a grid with room to spare (few printers, tall flex-allocated
-       list area) stretches its row *tracks* to fill all of it too, which
-       blows up a lone card to the whole panel's height instead of just
-       matching its row-mate. */
-    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-    align-items: stretch; align-content: start;
-    gap: 8px 10px; flex: 1 1 auto; min-height: 120px; overflow-y: auto; padding-right: 4px; margin-bottom: 12px;
-  }
-  .bulk-printer-option { cursor: pointer; padding: 8px 10px; }
-  .bulk-printer-option input[type="checkbox"] { cursor: pointer; }
-  .bulk-printer-main strong { font-size: 12.5px; }
-  .rec-row { grid-column: 2 / 3; margin-top: 2px; opacity: .65; font-size: 11px; }
-  .op-prepared-badge { grid-column: 2 / 3; margin-top: 4px; width: fit-content; padding: 4px 8px; }
-  .actions-row { display: flex; justify-content: end; gap: 10px; margin-top: 12px; flex: 0 0 auto; }
-  #startPrintRow { margin-top: 8px; flex: 0 0 auto; }
-  @media (max-width: 620px) {
-    #printerList { grid-template-columns: 1fr; }
-  }
-  .progress-track { position: relative; height: 10px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); overflow: hidden; margin-top: 10px; }
-  .progress-fill { height: 100%; width: 4%; border-radius: 999px; background: var(--accent); transition: width .35s ease, background .2s ease; }
-  .progress-fill.indeterminate { width: 40% !important; animation: progress-slide 1.1s ease-in-out infinite; }
-  @keyframes progress-slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
-  .mini-progress { grid-column: 2 / 3; margin-top: 6px; }
-  .mini-progress .progress-track { margin-top: 4px; }
-  .mini-progress-label { font-size: 11px; opacity: .75; margin-top: 3px; }
-  .machine-notice { padding: 10px 12px; margin: 4px 0 8px; border-left: 3px solid var(--accent); border-radius: 4px; background: var(--panel-2); color: var(--accent); font-size: 12.5px; }
-  a.logo-link { color: var(--accent); text-decoration: none; font-weight: 700; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; }
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="eyebrow"><a class="logo-link" href="http://__SCALEX_HOST__:__SCALEX_PORT__/" target="_blank">ScaleX LAN Manager</a> \u00b7 Network sending</div>
-  <h1>\u041a\u0443\u0434\u0430 \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0444\u0430\u0439\u043b?</h1>
-  <p id="loadingNotice" class="notice">\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e \u0441\u043f\u0438\u0441\u043e\u043a \u043f\u0440\u0438\u043d\u0442\u0435\u0440\u043e\u0432 \u0441 ScaleX\u2026</p>
-
-  <div id="uploadZone" class="bulk-file-picker" style="display:none">
-    <input type="file" id="fileInput" accept=".ctb,.goo,.cbddlp,.pwmx">
-    <strong>\u0412\u044b\u0431\u0435\u0440\u0438 \u0438\u043b\u0438 \u043f\u0435\u0440\u0435\u0442\u0430\u0449\u0438 \u0444\u0430\u0439\u043b CTB / GOO</strong>
-    <span>\u041d\u0430\u043f\u0440\u0438\u043c\u0435\u0440, \u0442\u043e\u0442, \u0447\u0442\u043e CHITUBOX \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u043b \u043e\u0431\u044b\u0447\u043d\u044b\u043c \u00abSave\u00bb \u2014 \u0431\u0435\u0437 ChituManager</span>
-  </div>
-
-  <div id="form" style="display:none">
-    <label>\u0418\u043c\u044f \u0444\u0430\u0439\u043b\u0430 (\u043c\u043e\u0436\u043d\u043e \u0438\u0437\u043c\u0435\u043d\u0438\u0442\u044c \u043f\u0435\u0440\u0435\u0434 \u043e\u0442\u043f\u0440\u0430\u0432\u043a\u043e\u0439)
-      <input type="text" id="filenameInput">
-    </label>
-
-    <label>\u041f\u043e\u0438\u0441\u043a \u043f\u0440\u0438\u043d\u0442\u0435\u0440\u0430
-      <input type="search" id="search" placeholder="\u0438\u043c\u044f, IP, \u043c\u043e\u0434\u0435\u043b\u044c\u2026">
-    </label>
-
-    <p id="machineNotice" class="machine-notice" style="display:none"></p>
-
-    <div class="filters-row" id="viewFiltersRow">
-      <label class="checkbox compact"><input type="checkbox" id="onlineOnlyCb" checked><span>\u041f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0442\u044c \u0432\u043a\u043b\u044e\u0447\u0451\u043d\u043d\u044b\u0435</span></label>
-      <label class="checkbox compact"><input type="checkbox" id="hideBusyCb" checked><span>\u0421\u043a\u0440\u044b\u0432\u0430\u0442\u044c \u0437\u0430\u043d\u044f\u0442\u044b\u0435</span></label>
-      <label class="checkbox compact" id="matchOnlyRow" style="display:none"><input type="checkbox" id="matchOnlyCb" checked><span>\u041f\u043e\u0434\u0445\u043e\u0434\u0438\u0442 \u043f\u043e\u0434 \u0444\u0430\u0439\u043b</span></label>
-    </div>
-
-    <div class="toolbar-row">
-      <div class="filters-row">
-        <button type="button" class="secondary small-button" id="selectAllBtn">\u0412\u044b\u0431\u0440\u0430\u0442\u044c \u0432\u0441\u0435 \u0432\u0438\u0434\u0438\u043c\u044b\u0435</button>
-        <button type="button" class="secondary small-button" id="clearAllBtn">\u0421\u043d\u044f\u0442\u044c \u0432\u0441\u0451</button>
-      </div>
-      <span class="bulk-selected-count" id="selectedCount">\u0412\u044b\u0431\u0440\u0430\u043d\u043e: 0</span>
-    </div>
-
-    <div id="printerList"></div>
-
-    <label class="checkbox" id="startPrintRow">
-      <input type="checkbox" id="startPrintCb">
-      <span>\u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u043f\u0435\u0447\u0430\u0442\u044c \u0441\u0440\u0430\u0437\u0443 \u043f\u043e\u0441\u043b\u0435 \u043e\u0442\u043f\u0440\u0430\u0432\u043a\u0438</span>
-    </label>
-
-    <div class="actions-row">
-      <button type="button" class="primary" id="sendBtn" disabled>\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c</button>
-    </div>
-  </div>
-
-  <div class="actions-row">
-    <button type="button" class="secondary" id="closeWindowBtn" style="display:none">\u0417\u0430\u043a\u0440\u044b\u0442\u044c \u043e\u043a\u043d\u043e</button>
-  </div>
-</div>
-
-<script>
-const params = new URLSearchParams(location.search);
-let pendingId = params.get('id');
-let printers = [];
-let detectedMachine = null;  // CTB's own embedded target-machine name, if found
-
-function printerStateLabel(p) {
-  const status = p.status || {};
-  if (status.online === false || !p.status) return {cls: '', text: '\u041e\u0444\u0444\u043b\u0430\u0439\u043d'};
-  if (isBusy(p)) return {cls: 'is-error', text: '\u041f\u0435\u0447\u0430\u0442\u0430\u0435\u0442'};
-  return {cls: 'is-ready', text: '\u0414\u043e\u0441\u0442\u0443\u043f\u0435\u043d'};
+PICKER_QSS = """
+* { font-family: "%(font)s"; }
+QMainWindow, #pickerCentral, #pickerScrollContents { background: %(bg)s; }
+QLabel { color: %(text)s; }
+#eyebrowLabel { color: %(accent)s; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+#headingLabel { color: %(text)s; font-size: 17px; font-weight: 700; }
+#fieldLabel { color: %(dim)s; font-size: 11.5px; }
+#machineNotice { background: %(panel2)s; color: %(accent)s; border-left: 3px solid %(accent)s;
+    border-radius: 4px; padding: 8px 10px; }
+#selectedCountLabel { color: %(dim)s; font-size: 11.5px; }
+QLineEdit { background: %(inputbg)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: 8px; padding: 8px 10px; }
+QLineEdit:focus { border: 1px solid %(accent)s; }
+QLineEdit:disabled { color: %(dim)s; }
+QCheckBox { color: %(text)s; spacing: 6px; }
+QCheckBox:disabled { color: %(dim)s; }
+QPushButton { background: %(panel)s; color: %(text)s; border: 1px solid %(line)s;
+    border-radius: 9px; padding: 9px 15px; }
+QPushButton:hover { border: 1px solid %(accent)s; }
+QPushButton:disabled { color: %(dim)s; }
+#sendBtn { background: %(accent)s; color: %(accenttext)s; font-weight: 700; border: none; }
+#sendBtn:disabled { background: #25292c; color: %(dim)s; }
+QScrollArea { border: none; background: transparent; }
+#printerRow { background: %(cardbg)s; border: 1px solid %(line)s; border-radius: 9px; }
+#printerRow[selected="true"] { border: 1px solid rgba(232, 255, 101, .65); background: rgba(232, 255, 101, .06); }
+#printerName { color: %(text)s; font-size: 12.5px; font-weight: 700; }
+#printerMeta { color: %(dim)s; font-size: 11.5px; }
+#stateLabel[state="ready"] { color: %(green)s; font-size: 11px; font-weight: 600; }
+#stateLabel[state="busy"] { color: %(red)s; font-size: 11px; font-weight: 600; }
+#stateLabel[state="offline"] { color: %(dim)s; font-size: 11px; font-weight: 600; }
+#preparedBadge { font-size: 10.5px; border-radius: 4px; padding: 3px 7px; }
+#preparedBadge[prepared="true"] { color: %(green)s; background: rgba(115, 212, 154, .12); }
+#preparedBadge[prepared="false"] { color: %(dim)s; background: %(panel2)s; }
+#recSummary { color: %(dim)s; font-size: 11px; }
+#miniProgressLabel { color: %(dim)s; font-size: 11px; }
+QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 5px;
+    max-height: 8px; min-height: 8px; text-align: center; color: transparent; }
+QProgressBar::chunk { background: %(accent)s; border-radius: 5px; }
+""" % {
+    "bg": COLOR_BG, "panel": COLOR_PANEL, "panel2": COLOR_PANEL_2, "line": COLOR_LINE,
+    "text": COLOR_TEXT, "dim": COLOR_TEXT_DIM, "accent": COLOR_ACCENT,
+    "accenttext": COLOR_ACCENT_TEXT, "green": COLOR_GREEN, "red": COLOR_RED,
+    "cardbg": COLOR_CARD_BG, "inputbg": COLOR_INPUT_BG, "font": FONT_FAMILY,
 }
 
-function isBusy(p) {
-  // Ported straight from ScaleX's own isPrinterPrintingStatus() (app.js) -
-  // printStatusText alone has way more "doing something" values than just
-  // "printing"/"exposing" (homing, lifting, preparing, pausing, ...), so a
-  // short allowlist under-detects busy printers. This matches what the
-  // real manager itself considers busy.
-  const s = p.status || {};
-  const currentStatus = Number(s.currentStatus ?? 0);
-  const printStatus = Number(s.printStatus ?? 0);
-  const text = String(s.printStatusText || '').toLowerCase();
-  if (currentStatus === 0 || [8, 9].includes(printStatus) || ['idle', 'stopped', 'complete', 'completed'].includes(text)) {
-    return false;
-  }
-  return currentStatus === 1 ||
-    [1, 2, 3, 4, 5, 6, 7].includes(printStatus) ||
-    ['preparing', 'homing', 'lifting', 'exposing', 'printing', 'pausing', 'paused', 'stopping'].includes(text);
-}
 
-function isOnline(p) {
-  return !!(p.status && p.status.online === true);
-}
-
-function matchesMachine(p) {
-  if (!detectedMachine) return true;
-  const model = (p.model || p.machineModel || '').trim();
-  if (!model) return true;  // printer has no model info - can't tell, don't hide it
-  // Suffix match, not exact/substring: CHITUBOX sometimes glues a couple of
-  // stray bytes onto the *front* of the embedded machine name (harmless
-  // binary noise, confirmed by inspecting real captured files), and this
-  // also correctly tells "Saturn 4 Ultra" apart from "Saturn 4 Ultra 16K"
-  // (a plain substring check would match both against either file).
-  return detectedMachine.toLowerCase().endsWith(model.toLowerCase());
-}
-
-function recSummary(p) {
-  const parts = [];
-  if (p.recommendedNormalExposure != null && p.recommendedNormalExposure !== '') parts.push('\u043e\u0431\u044b\u0447\u043d\u0430\u044f ' + p.recommendedNormalExposure + 's');
-  if (p.recommendedBottomExposure != null && p.recommendedBottomExposure !== '') parts.push('\u043d\u0438\u0436\u043d\u044f\u044f ' + p.recommendedBottomExposure + 's');
-  if (p.recommendedBottomLayers != null && p.recommendedBottomLayers !== '') parts.push(p.recommendedBottomLayers + ' \u043d\u0438\u0436\u043d\u0438\u0445 \u0441\u043b\u043e\u0451\u0432');
-  return parts.join(', ');
-}
-
-function hasRec(p) {
-  return (p.recommendedNormalExposure != null && p.recommendedNormalExposure !== '')
-    || (p.recommendedBottomExposure != null && p.recommendedBottomExposure !== '')
-    || (p.recommendedBottomLayers != null && p.recommendedBottomLayers !== '');
-}
-
-function renderList() {
-  const q = document.getElementById('search').value.trim().toLowerCase();
-  const list = document.getElementById('printerList');
-  // Re-rendering (search/filters/live refresh) must not silently drop
-  // whatever the user already ticked - capture it first, reapply after.
-  const wasSelected = new Set(Array.from(list.querySelectorAll('.bulk-printer-select:checked')).map(b => b.value));
-  const wasRecChecked = new Set(Array.from(list.querySelectorAll('.apply-rec:checked'))
-    .map(cb => cb.closest('.bulk-printer-option').dataset.printerId));
-  list.innerHTML = '';
-  const onlineOnly = document.getElementById('onlineOnlyCb').checked;
-  const hideBusy = document.getElementById('hideBusyCb').checked;
-  const matchOnly = detectedMachine && document.getElementById('matchOnlyCb').checked;
-  printers
-    .filter(p => {
-      if (onlineOnly && !isOnline(p)) return false;
-      if (hideBusy && isBusy(p)) return false;
-      if (matchOnly && !matchesMachine(p)) return false;
-      if (!q) return true;
-      const hay = [p.displayName, p.name, p.currentIp, p.model, p.machineModel].filter(Boolean).join(' ').toLowerCase();
-      return hay.includes(q);
-    })
-    .forEach(p => {
-      const state = printerStateLabel(p);
-      const name = p.displayName || p.name || p.liveName || p.id;
-      const model = p.model || p.machineModel || '';
-      const ip = p.currentIp || p.ipAddress || '';
-
-      const opt = document.createElement('div');
-      opt.className = 'bulk-printer-option';
-      opt.dataset.printerId = p.id;
-
-      const label = document.createElement('label');
-      label.className = 'bulk-printer-choice';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.className = 'bulk-printer-select';
-      cb.value = p.id;
-      cb.checked = wasSelected.has(String(p.id));
-      const main = document.createElement('span');
-      main.className = 'bulk-printer-main';
-      main.innerHTML = '<strong>' + name + '</strong><span>' + model + ' \u2014 ' + ip + '</span>';
-      label.appendChild(cb);
-      label.appendChild(main);
-      opt.appendChild(label);
-
-      const stateSpan = document.createElement('span');
-      stateSpan.className = 'bulk-printer-state ' + state.cls;
-      stateSpan.textContent = state.text;
-      opt.appendChild(stateSpan);
-
-      if (hasRec(p)) {
-        const recRow = document.createElement('label');
-        recRow.className = 'checkbox compact rec-row';
-        const recCb = document.createElement('input');
-        recCb.type = 'checkbox';
-        recCb.className = 'apply-rec';
-        recCb.checked = wasRecChecked.has(String(p.id));
-        recRow.appendChild(recCb);
-        recRow.appendChild(document.createTextNode('\u043f\u0440\u0438\u043c\u0435\u043d\u0438\u0442\u044c \u0440\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0430\u0446\u0438\u0438: ' + recSummary(p)));
-        opt.appendChild(recRow);
-      }
-
-      // Same grey/green pill ScaleX's own manager shows for this printer -
-      // purely a visual read-out of whether it's confirmed safe to print
-      // on (operatorPrepared), not something own_manager lets you toggle.
-      const prep = document.createElement('span');
-      prep.className = 'operator-prepared-toggle op-prepared-badge' + (p.operatorPrepared === true ? ' active' : '');
-      prep.innerHTML = '<span class="prepared-dot"></span>' + (p.operatorPrepared === true ? '\u041f\u0440\u0438\u043d\u0442\u0435\u0440 \u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d' : '\u041d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d');
-      opt.appendChild(prep);
-
-      cb.addEventListener('change', updateSelectedCount);
-      list.appendChild(opt);
-    });
-  updateSelectedCount();
-}
-
-function updateSelectedCount() {
-  const boxes = Array.from(document.querySelectorAll('.bulk-printer-select'));
-  const checked = boxes.filter(b => b.checked);
-  document.getElementById('selectedCount').textContent = '\u0412\u044b\u0431\u0440\u0430\u043d\u043e: ' + checked.length;
-  document.getElementById('sendBtn').disabled = checked.length === 0;
-}
-
-document.getElementById('search').addEventListener('input', renderList);
-document.getElementById('onlineOnlyCb').addEventListener('change', renderList);
-document.getElementById('hideBusyCb').addEventListener('change', renderList);
-document.getElementById('matchOnlyCb').addEventListener('change', renderList);
-document.getElementById('selectAllBtn').addEventListener('click', () => {
-  document.querySelectorAll('.bulk-printer-select').forEach(b => { b.checked = true; b.dispatchEvent(new Event('change')); });
-});
-document.getElementById('clearAllBtn').addEventListener('click', () => {
-  document.querySelectorAll('.bulk-printer-select').forEach(b => { b.checked = false; b.dispatchEvent(new Event('change')); });
-});
-
-const TARGET_PHASE_LABELS = {
-  queued: '\u0412 \u043e\u0447\u0435\u0440\u0435\u0434\u0438',
-  uploading: '\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430',
-  sending: '\u041f\u0435\u0440\u0435\u0434\u0430\u0447\u0430',
-  done: '\u0413\u043e\u0442\u043e\u0432\u043e',
-  error: '\u041e\u0448\u0438\u0431\u043a\u0430',
-};
-
-function setMiniProgress(opt, phase, percent, message) {
-  const fill = opt.querySelector('.progress-fill');
-  const label = opt.querySelector('.mini-progress-label');
-  if (!fill || !label) return;
-  if (phase === 'error') {
-    fill.classList.remove('indeterminate');
-    fill.style.width = '100%';
-    fill.style.background = 'var(--red)';
-    label.textContent = '\u041e\u0448\u0438\u0431\u043a\u0430' + (message ? ': ' + message : '');
-    return;
-  }
-  if (phase === 'done') {
-    fill.classList.remove('indeterminate');
-    fill.style.width = '100%';
-    label.textContent = '\u0413\u043e\u0442\u043e\u0432\u043e';
-    return;
-  }
-  if (percent === null || percent === undefined) {
-    fill.classList.add('indeterminate');
-  } else {
-    fill.classList.remove('indeterminate');
-    fill.style.width = Math.max(4, Math.min(100, percent)) + '%';
-  }
-  label.textContent = (TARGET_PHASE_LABELS[phase] || phase) + (message ? ': ' + message : '');
-}
-
-function closeWindow() {
-  if (window.pywebview && window.pywebview.api && window.pywebview.api.close) {
-    window.pywebview.api.close();
-  } else {
-    window.close();  // e.g. opened in a plain browser tab instead of the native window
-  }
-}
-
-document.getElementById('closeWindowBtn').addEventListener('click', closeWindow);
-
-async function pollSendStatus() {
-  let st;
-  try {
-    st = await (await fetch('/api/send-status?id=' + encodeURIComponent(pendingId))).json();
-  } catch (e) {
-    setTimeout(pollSendStatus, 1500);
-    return;
-  }
-  const targetList = st.targets || [];
-  let allDone = targetList.length > 0;
-  targetList.forEach(t => {
-    const opt = document.querySelector('.bulk-printer-option[data-printer-id="' + CSS.escape(String(t.printerId)) + '"]');
-    if (!opt) return;
-    setMiniProgress(opt, t.phase, t.percent, null);
-    if (t.phase !== 'done' && t.phase !== 'error') allDone = false;
-  });
-  if (!allDone) {
-    setTimeout(pollSendStatus, 700);
-    return;
-  }
-  document.getElementById('closeWindowBtn').style.display = 'inline-flex';
-}
-
-document.getElementById('sendBtn').addEventListener('click', async () => {
-  if (printerRefreshTimer) { clearInterval(printerRefreshTimer); printerRefreshTimer = null; }
-  const nameInput = document.getElementById('filenameInput').value.trim();
-  const options = Array.from(document.querySelectorAll('.bulk-printer-option'));
-  const targets = [];
-  const selectedIds = new Set();
-  options.forEach(opt => {
-    const cb = opt.querySelector('.bulk-printer-select');
-    if (!cb.checked) return;
-    const recCb = opt.querySelector('.apply-rec');
-    targets.push({printerId: opt.dataset.printerId, applyRecommendations: !!(recCb && recCb.checked)});
-    selectedIds.add(opt.dataset.printerId);
-  });
-  const startPrint = document.getElementById('startPrintCb').checked;
-
-  // Lock the form instead of replacing it with a generic full-screen
-  // status: keep only the printers actually being sent to, each gets its
-  // own mini progress bar right under its card.
-  document.getElementById('filenameInput').disabled = true;
-  document.getElementById('viewFiltersRow').style.display = 'none';
-  document.getElementById('search').closest('label').style.display = 'none';
-  document.querySelector('.toolbar-row').style.display = 'none';
-  document.getElementById('startPrintRow').style.display = 'none';
-  document.querySelector('.actions-row').style.display = 'none';
-
-  options.forEach(opt => {
-    if (!selectedIds.has(opt.dataset.printerId)) {
-      opt.style.display = 'none';
-      return;
-    }
-    opt.querySelectorAll('input').forEach(inp => { inp.disabled = true; });
-    const bar = document.createElement('div');
-    bar.className = 'mini-progress';
-    bar.innerHTML = '<div class="progress-track"><div class="progress-fill indeterminate"></div></div>'
-      + '<div class="mini-progress-label">\u0412 \u043e\u0447\u0435\u0440\u0435\u0434\u0438\u2026</div>';
-    opt.appendChild(bar);
-  });
-
-  const resp = await fetch('/api/send', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({id: pendingId, displayName: nameInput, targets: targets, startPrint: startPrint})
-  });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    document.querySelectorAll('.bulk-printer-option').forEach(opt => setMiniProgress(opt, 'error', 100, payload.error || String(resp.status)));
-    document.getElementById('closeWindowBtn').style.display = 'inline-flex';
-    return;
-  }
-  pollSendStatus();
-});
-
-document.getElementById('filenameInput').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('search').focus(); });
-document.getElementById('search').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('sendBtn').click(); });
-
-let printerRefreshTimer = null;
-
-async function refreshPrinters() {
-  try {
-    printers = await (await fetch('/api/printers')).json();
-    printers.sort((a, b) => (a.displayName || a.name || '').localeCompare(b.displayName || b.name || ''));
-    renderList();
-  } catch (e) { /* keep showing the last known list, try again next tick */ }
-}
-
-async function loadPrintersAndShowForm(filename, machineName) {
-  printers = await (await fetch('/api/printers')).json();
-  printers.sort((a, b) => (a.displayName || a.name || '').localeCompare(b.displayName || b.name || ''));
-  document.title = 'Network sending \u2014 ' + filename;
-  document.getElementById('filenameInput').value = filename;
-  document.getElementById('loadingNotice').style.display = 'none';
-  document.getElementById('uploadZone').style.display = 'none';
-  document.getElementById('form').style.display = 'flex';
-
-  detectedMachine = (machineName || '').trim() || null;
-  const machineNotice = document.getElementById('machineNotice');
-  const matchRow = document.getElementById('matchOnlyRow');
-  if (detectedMachine) {
-    machineNotice.textContent = '\u041d\u0430\u0440\u0435\u0437\u0430\u043d\u043e \u043f\u043e\u0434: ' + detectedMachine;
-    machineNotice.style.display = 'block';
-    matchRow.style.display = 'flex';
-  } else {
-    machineNotice.style.display = 'none';
-    matchRow.style.display = 'none';
-  }
-
-  renderList();
-  // Printer status (online/busy/prepared) is polled live from ScaleX while
-  // you're still deciding where to send - so toggling "\u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u043b\u0435\u043d" or a
-  // print finishing on the real manager shows up here too, not just a
-  // stale snapshot from the moment the picker opened. Stops the instant
-  // Send is clicked (see sendBtn handler) so it can't clobber the
-  // per-printer progress bars.
-  printerRefreshTimer = setInterval(refreshPrinters, 5000);
-}
-
-async function uploadFile(file) {
-  document.getElementById('loadingNotice').textContent = '\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e ' + file.name + '\u2026';
-  document.getElementById('loadingNotice').style.display = 'block';
-  document.getElementById('uploadZone').style.display = 'none';
-  const resp = await fetch('/api/manual-upload', {
-    method: 'POST',
-    headers: {'X-File-Name': encodeURIComponent(file.name)},
-    body: file,
-  });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    document.getElementById('loadingNotice').textContent = '\u041e\u0448\u0438\u0431\u043a\u0430: ' + (payload.error || resp.status);
-    document.getElementById('uploadZone').style.display = 'grid';
-    return;
-  }
-  pendingId = payload.id;
-  history.replaceState(null, '', '?id=' + encodeURIComponent(pendingId));
-  await loadPrintersAndShowForm(file.name, payload.machineName);
-}
-
-const fileInput = document.getElementById('fileInput');
-const uploadZone = document.getElementById('uploadZone');
-fileInput.addEventListener('change', () => { if (fileInput.files[0]) uploadFile(fileInput.files[0]); });
-uploadZone.addEventListener('click', () => fileInput.click());
-uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
-uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
-uploadZone.addEventListener('drop', e => {
-  e.preventDefault();
-  uploadZone.classList.remove('drag-over');
-  if (e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]);
-});
-
-(async function init() {
-  if (!pendingId) {
-    // No captured file waiting - offer manual pick (e.g. something
-    // CHITUBOX saved normally, no ChituManager involved at all).
-    document.getElementById('loadingNotice').style.display = 'none';
-    document.getElementById('uploadZone').style.display = 'grid';
-    return;
-  }
-  const pendingResp = await fetch('/api/pending?id=' + encodeURIComponent(pendingId));
-  if (!pendingResp.ok) {
-    document.getElementById('loadingNotice').textContent = '\u042d\u0442\u043e\u0442 \u0444\u0430\u0439\u043b \u0443\u0436\u0435 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d \u0438\u043b\u0438 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.';
-    return;
-  }
-  const pending = await pendingResp.json();
-  await loadPrintersAndShowForm(pending.filename, pending.machineName);
-})();
-</script>
-</body>
-</html>
-"""
+# ---------------------------------------------------------------------------
+# Printer filter/status helpers - ported straight from the old PAGE_HTML's
+# JS (isBusy/isOnline/matchesMachine), which itself mirrors ScaleX's own
+# isPrinterPrintingStatus() (app.js). Kept as plain functions so the same
+# logic could be unit-tested or reused outside the GUI later.
+# ---------------------------------------------------------------------------
+_BUSY_IDLE_TEXT = ("idle", "stopped", "complete", "completed")
+_BUSY_TEXT = ("preparing", "homing", "lifting", "exposing", "printing", "pausing", "paused", "stopping")
 
 
-def _render_page():
-    return PAGE_HTML.replace("__SCALEX_HOST__", SCALEX_HOST).replace("__SCALEX_PORT__", str(SCALEX_PORT)).encode("utf-8")
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def _send_bytes(self, status, ctype, body):
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
-
-    def _send_json(self, status, obj):
-        self._send_bytes(status, "application/json", json.dumps(obj).encode("utf-8"))
-
-    def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        query = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
-
-        if path == "/" or path == "/index.html":
-            self._send_bytes(200, "text/html; charset=utf-8", _render_page())
-            return
-
-        if path == "/api/pending":
-            item_id = (query.get("id") or [None])[0]
-            with PENDING_LOCK:
-                item = PENDING.get(item_id)
-            if not item:
-                self._send_json(404, {"error": "not found"})
-                return
-            self._send_json(200, {"filename": item["filename"], "machineName": item.get("machine_name")})
-            return
-
-        if path == "/api/printers":
-            try:
-                self._send_json(200, fetch_printers())
-            except Exception as e:
-                logmsg("=== /api/printers proxy FAILED: %s ===", e)
-                self._send_json(200, [])
-            return
-
-        if path == "/api/send-status":
-            item_id = (query.get("id") or [None])[0]
-            with SEND_STATUS_LOCK:
-                st = SEND_STATUS.get(item_id)
-            self._send_json(200, st or {"phase": "unknown"})
-            return
-
-        self._send_bytes(404, "text/plain", b"")
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(length) if length else b""
-        path = self.path.split("?", 1)[0]
-
-        if path == "/api/manual-upload":
-            # Manual path: pick any local file you've already saved
-            # yourself (e.g. via CHITUBOX's own plain "Save", no manager
-            # involved at all) and hand it to own_manager directly, same
-            # idea as the automatic SlicerFile capture. Raw bytes as body,
-            # like every other upload in this file - X-File-Name header
-            # names it.
-            raw_name = self.headers.get("X-File-Name", "")
-            try:
-                filename = urllib.parse.unquote(raw_name) or "upload.ctb"
-            except Exception:
-                filename = "upload.ctb"
-            filename = os.path.basename(filename)  # no path traversal via the header
-            if not filename.lower().endswith(SLICE_EXTENSIONS):
-                self._send_json(400, {"error": "Только файлы: " + ", ".join(SLICE_EXTENSIONS)})
-                return
-            if not body:
-                self._send_json(400, {"error": "empty upload"})
-                return
-            try:
-                os.makedirs(MANUAL_DIR, exist_ok=True)
-                dest = os.path.join(MANUAL_DIR, filename)
-                base, ext = os.path.splitext(dest)
-                n = 1
-                while os.path.exists(dest):
-                    dest = "%s (%d)%s" % (base, n, ext)
-                    n += 1
-                with open(dest, "wb") as f:
-                    f.write(body)
-            except Exception as e:
-                logmsg("=== manual-upload FAILED: %s (%s) ===", filename, e)
-                self._send_json(500, {"error": str(e)})
-                return
-
-            item_id = uuid.uuid4().hex
-            machine_name = extract_ctb_machine_name(dest)
-            with PENDING_LOCK:
-                PENDING[item_id] = {"file_path": dest, "filename": os.path.basename(dest), "machine_name": machine_name}
-            logmsg("=== MANUAL UPLOAD: %s (%d bytes) id=%s machine=%r ===", dest, len(body), item_id, machine_name)
-            self._send_json(200, {"id": item_id, "machineName": machine_name})
-            return
-
-        try:
-            data = json.loads(body.decode("utf-8", "replace")) if body else {}
-        except Exception:
-            data = {}
-
-        if path == "/api/send":
-            item_id = data.get("id")
-            with PENDING_LOCK:
-                item = PENDING.pop(item_id, None)
-            with _pending_windows_lock:
-                _pending_windows.pop(item_id, None)
-            if not item:
-                self._send_json(404, {"error": "unknown or already-handled id"})
-                return
-            targets = data.get("targets") or []
-            if not targets:
-                self._send_json(400, {"error": "no printers selected"})
-                return
-            display_name = (data.get("displayName") or "").strip() or item["filename"]
-            src_ext = os.path.splitext(item["filename"])[1]
-            if src_ext and not display_name.lower().endswith(src_ext.lower()):
-                display_name += src_ext
-            start_print = bool(data.get("startPrint"))
-            logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s) ===",
-                   item["filename"], display_name, json.dumps(targets), start_print)
-            send_in_background(item["file_path"], targets, display_name=display_name,
-                                start_print=start_print, item_id=item_id)
-            self._send_json(200, {"ok": True})
-            return
-
-        self._send_bytes(404, "text/plain", b"")
-
-
-def start_http_server():
-    global HTTP_PORT
+def printer_is_busy(p):
+    s = p.get("status") or {}
     try:
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", FIXED_HTTP_PORT), Handler)
-    except OSError as e:
-        logmsg("=== port %d busy (%s), falling back to a random port ===", FIXED_HTTP_PORT, e)
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    HTTP_PORT = httpd.server_address[1]
-    logmsg("=== HTTP server listening on 127.0.0.1:%d ===", HTTP_PORT)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return HTTP_PORT
+        current_status = int(s.get("currentStatus") or 0)
+    except (TypeError, ValueError):
+        current_status = 0
+    try:
+        print_status = int(s.get("printStatus") or 0)
+    except (TypeError, ValueError):
+        print_status = 0
+    text = str(s.get("printStatusText") or "").lower()
+    if current_status == 0 or print_status in (8, 9) or text in _BUSY_IDLE_TEXT:
+        return False
+    return current_status == 1 or print_status in (1, 2, 3, 4, 5, 6, 7) or text in _BUSY_TEXT
 
 
-def register_pending(dest_path):
-    """Add a captured file to PENDING and open the picker page for it."""
-    item_id = uuid.uuid4().hex
+def printer_is_online(p):
+    return bool((p.get("status") or {}).get("online") is True)
+
+
+def printer_matches_machine(p, detected_machine):
+    if not detected_machine:
+        return True
+    model = (p.get("model") or p.get("machineModel") or "").strip()
+    if not model:
+        return True  # printer has no model info - can't tell, don't hide it
+    # Suffix match, not exact/substring: CHITUBOX sometimes glues a couple of
+    # stray bytes onto the *front* of the embedded machine name, and this
+    # also correctly tells "Saturn 4 Ultra" apart from "Saturn 4 Ultra 16K"
+    # (a plain substring check would match both against either file).
+    return detected_machine.lower().endswith(model.lower())
+
+
+def printer_rec_summary(p):
+    parts = []
+    if p.get("recommendedNormalExposure") not in (None, ""):
+        parts.append("обычная %ss" % p["recommendedNormalExposure"])
+    if p.get("recommendedBottomExposure") not in (None, ""):
+        parts.append("нижняя %ss" % p["recommendedBottomExposure"])
+    if p.get("recommendedBottomLayers") not in (None, ""):
+        parts.append("%s нижних слоёв" % p["recommendedBottomLayers"])
+    return ", ".join(parts)
+
+
+TARGET_PHASE_LABELS = {
+    "queued": "В очереди",
+    "uploading": "Загрузка",
+    "sending": "Передача",
+    "done": "Готово",
+    "error": "Ошибка",
+}
+
+
+class PrinterRowWidget(QFrame):
+    """One printer card - persists for the printer's whole lifetime in this
+    window (created once when first seen, updated in place on every 5s
+    refresh) so filtering/searching never has to save-and-restore checkbox
+    state the way the old JS page did (it had to destroy+recreate DOM nodes
+    on every re-render; a native widget just gets hidden/shown/repositioned
+    instead, so nothing needs to remember what was checked)."""
+
+    def __init__(self, printer, parent=None):
+        super().__init__(parent)
+        self.setObjectName("printerRow")
+        self.printer_id = str(printer.get("id"))
+        self.printer = printer
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        self.checkbox = QCheckBox()
+        self.checkbox.toggled.connect(self._on_checkbox_toggled)
+        top.addWidget(self.checkbox)
+
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        self.name_label = QLabel()
+        self.name_label.setObjectName("printerName")
+        self.meta_label = QLabel()
+        self.meta_label.setObjectName("printerMeta")
+        names.addWidget(self.name_label)
+        names.addWidget(self.meta_label)
+        top.addLayout(names, 1)
+
+        self.state_label = QLabel()
+        self.state_label.setObjectName("stateLabel")
+        top.addWidget(self.state_label, 0, Qt.AlignTop)
+        outer.addLayout(top)
+
+        self.rec_row = QWidget()
+        rec_layout = QHBoxLayout(self.rec_row)
+        rec_layout.setContentsMargins(24, 0, 0, 0)
+        rec_layout.setSpacing(6)
+        self.rec_checkbox = QCheckBox("применить рекомендации:")
+        self.rec_summary_label = QLabel()
+        self.rec_summary_label.setObjectName("recSummary")
+        rec_layout.addWidget(self.rec_checkbox)
+        rec_layout.addWidget(self.rec_summary_label, 1)
+        outer.addWidget(self.rec_row)
+
+        self.prepared_badge = QLabel()
+        self.prepared_badge.setObjectName("preparedBadge")
+        self.prepared_badge.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        badge_row = QHBoxLayout()
+        badge_row.setContentsMargins(24, 0, 0, 0)
+        badge_row.addWidget(self.prepared_badge)
+        badge_row.addStretch(1)
+        outer.addLayout(badge_row)
+
+        self.mini_progress = QProgressBar()
+        self.mini_progress.setRange(0, 100)
+        self.mini_progress_label = QLabel()
+        self.mini_progress_label.setObjectName("miniProgressLabel")
+        mini_wrap = QVBoxLayout()
+        mini_wrap.setContentsMargins(24, 2, 0, 0)
+        mini_wrap.setSpacing(2)
+        mini_wrap.addWidget(self.mini_progress)
+        mini_wrap.addWidget(self.mini_progress_label)
+        self.mini_progress_widget = QWidget()
+        self.mini_progress_widget.setLayout(mini_wrap)
+        self.mini_progress_widget.setVisible(False)
+        outer.addWidget(self.mini_progress_widget)
+
+        self.on_selection_changed = None  # set by PickerWindow
+        self.apply_data(printer)
+
+    def _on_checkbox_toggled(self, _checked):
+        self.setProperty("selected", "true" if self.checkbox.isChecked() else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if self.on_selection_changed:
+            self.on_selection_changed()
+
+    def apply_data(self, printer):
+        """Refresh from a fresh /api/printers snapshot (live 5s refresh) -
+        never touches self.checkbox/self.rec_checkbox so the user's current
+        selection survives a background refresh."""
+        self.printer = printer
+        name = printer.get("displayName") or printer.get("name") or printer.get("liveName") or printer.get("id")
+        model = printer.get("model") or printer.get("machineModel") or ""
+        ip = printer.get("currentIp") or printer.get("ipAddress") or ""
+        self.name_label.setText(str(name))
+        self.meta_label.setText("%s — %s" % (model, ip) if model or ip else "")
+
+        if not printer.get("status") or printer.get("status", {}).get("online") is False:
+            state, text = "offline", "Оффлайн"
+        elif printer_is_busy(printer):
+            state, text = "busy", "Печатает"
+        else:
+            state, text = "ready", "Доступен"
+        self.state_label.setText(text)
+        self.state_label.setProperty("state", state)
+        self.state_label.style().unpolish(self.state_label)
+        self.state_label.style().polish(self.state_label)
+
+        summary = printer_rec_summary(printer)
+        has_rec = bool(summary)
+        self.rec_row.setVisible(has_rec)
+        if has_rec:
+            self.rec_summary_label.setText(summary)
+
+        prepared = printer.get("operatorPrepared") is True
+        self.prepared_badge.setText("Принтер подготовлен" if prepared else "Не подтверждён")
+        self.prepared_badge.setProperty("prepared", "true" if prepared else "false")
+        self.prepared_badge.style().unpolish(self.prepared_badge)
+        self.prepared_badge.style().polish(self.prepared_badge)
+
+    def matches_filters(self, query, online_only, hide_busy, match_only, detected_machine):
+        if online_only and not printer_is_online(self.printer):
+            return False
+        if hide_busy and printer_is_busy(self.printer):
+            return False
+        if match_only and not printer_matches_machine(self.printer, detected_machine):
+            return False
+        if query:
+            hay = " ".join(str(self.printer.get(k) or "") for k in
+                            ("displayName", "name", "currentIp", "model", "machineModel")).lower()
+            if query not in hay:
+                return False
+        return True
+
+    def set_locked_for_send(self, selected):
+        """Called once when a send starts: hides unselected cards, disables
+        inputs on the selected ones, and reveals their mini progress bar -
+        mirrors the old JS's sendBtn handler, which locked the whole form
+        and gave each selected printer its own progress bar in place."""
+        self.setVisible(selected)
+        if not selected:
+            return
+        self.checkbox.setEnabled(False)
+        self.rec_checkbox.setEnabled(False)
+        self.mini_progress_widget.setVisible(True)
+        self.mini_progress.setRange(0, 0)  # indeterminate
+        self.mini_progress_label.setText("В очереди…")
+
+    def set_mini_progress(self, phase, percent):
+        if phase == "error":
+            self.mini_progress.setRange(0, 100)
+            self.mini_progress.setValue(100)
+            self.mini_progress.setStyleSheet("QProgressBar::chunk { background: %s; }" % COLOR_RED)
+            self.mini_progress_label.setText("Ошибка")
+            return
+        self.mini_progress.setStyleSheet("")
+        if phase == "done":
+            self.mini_progress.setRange(0, 100)
+            self.mini_progress.setValue(100)
+            self.mini_progress_label.setText("Готово")
+            return
+        if percent is None:
+            self.mini_progress.setRange(0, 0)
+        else:
+            self.mini_progress.setRange(0, 100)
+            self.mini_progress.setValue(max(4, min(100, int(percent))))
+        self.mini_progress_label.setText(TARGET_PHASE_LABELS.get(phase, phase))
+
+
+class PickerWindow(QMainWindow):
+    """One per captured file - the desktop replacement for the old
+    PAGE_HTML page. file_path/filename/machine_name are known up front
+    (no PENDING/id indirection needed any more - this window IS the state,
+    there's no HTTP boundary between it and own_manager's own backend
+    functions any more)."""
+
+    _progress_signal = Signal(str, object, list)   # phase, percent(float|None), targets(list[dict])
+    _printers_signal = Signal(list, str)           # printers, error message ("" if ok)
+
+    def __init__(self, file_path, filename, machine_name):
+        super().__init__()
+        self.file_path = file_path
+        self.filename = filename
+        self.machine_name = (machine_name or "").strip() or None
+        self.rows = {}       # printer_id -> PrinterRowWidget
+        self.sending = False
+        self._loaded_once = False
+
+        self.setWindowTitle("Network sending — %s" % filename)
+        self.resize(760, 820)
+
+        central = QWidget()
+        central.setObjectName("pickerCentral")
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(8)
+
+        # Fixed vertical policy on every label above the form: QLabel's
+        # default ("Preferred") is technically allowed to grow past its
+        # sizeHint whenever nothing else claims the leftover space,
+        # which Qt was doing here - splitting the window's extra height
+        # evenly between eyebrow/heading/loading_label into visible gaps.
+        # Fixed rules that out unconditionally, so form_widget's own
+        # stretch=1 below is the *only* thing that can ever claim leftover
+        # vertical space, in every state (loading/error/loaded).
+        eyebrow = QLabel("SCALEX LAN MANAGER · NETWORK SENDING")
+        eyebrow.setObjectName("eyebrowLabel")
+        eyebrow.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        root.addWidget(eyebrow)
+        heading = QLabel("Куда отправить файл?")
+        heading.setObjectName("headingLabel")
+        heading.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        root.addWidget(heading)
+
+        self.loading_label = QLabel("Загружаю список принтеров с ScaleX…")
+        self.loading_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.loading_label.setWordWrap(True)
+        root.addWidget(self.loading_label)
+
+        self.form_widget = QWidget()
+        form = QVBoxLayout(self.form_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        self.form_widget.setVisible(False)
+        self.form_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        root.addWidget(self.form_widget, 1)
+
+        form.addWidget(self._field_label("Имя файла (можно изменить перед отправкой)"))
+        self.filename_edit = QLineEdit(filename)
+        form.addWidget(self.filename_edit)
+
+        form.addWidget(self._field_label("Поиск принтера"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("имя, IP, модель…")
+        self.search_edit.textChanged.connect(self._render_list)
+        form.addWidget(self.search_edit)
+
+        self.machine_notice = QLabel()
+        self.machine_notice.setObjectName("machineNotice")
+        self.machine_notice.setVisible(False)
+        form.addWidget(self.machine_notice)
+
+        filters_row = QHBoxLayout()
+        self.online_only_cb = QCheckBox("Показывать включённые")
+        self.online_only_cb.setChecked(True)
+        self.online_only_cb.toggled.connect(self._render_list)
+        self.hide_busy_cb = QCheckBox("Скрывать занятые")
+        self.hide_busy_cb.setChecked(True)
+        self.hide_busy_cb.toggled.connect(self._render_list)
+        self.match_only_cb = QCheckBox("Подходит под файл")
+        self.match_only_cb.setChecked(True)
+        self.match_only_cb.toggled.connect(self._render_list)
+        self.match_only_cb.setVisible(False)
+        filters_row.addWidget(self.online_only_cb)
+        filters_row.addWidget(self.hide_busy_cb)
+        filters_row.addWidget(self.match_only_cb)
+        filters_row.addStretch(1)
+        form.addLayout(filters_row)
+
+        toolbar_row = QHBoxLayout()
+        select_all_btn = QPushButton("Выбрать все видимые")
+        select_all_btn.clicked.connect(self._select_all_visible)
+        clear_all_btn = QPushButton("Снять всё")
+        clear_all_btn.clicked.connect(self._clear_all)
+        toolbar_row.addWidget(select_all_btn)
+        toolbar_row.addWidget(clear_all_btn)
+        toolbar_row.addStretch(1)
+        self.selected_count_label = QLabel("Выбрано: 0")
+        self.selected_count_label.setObjectName("selectedCountLabel")
+        toolbar_row.addWidget(self.selected_count_label)
+        self.toolbar_row = toolbar_row
+        form.addLayout(toolbar_row)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_contents = QWidget()
+        self.scroll_contents.setObjectName("pickerScrollContents")
+        self.list_layout = QVBoxLayout(self.scroll_contents)
+        self.list_layout.setSpacing(6)
+        self.list_layout.addStretch(1)  # keeps rows top-aligned as they're added before this
+        self.scroll_area.setWidget(self.scroll_contents)
+        form.addWidget(self.scroll_area, 1)
+
+        self.start_print_cb = QCheckBox("Запустить печать сразу после отправки")
+        form.addWidget(self.start_print_cb)
+
+        actions_row = QHBoxLayout()
+        actions_row.addStretch(1)
+        self.close_btn = QPushButton("Закрыть окно")
+        self.close_btn.clicked.connect(self.close)
+        self.close_btn.setVisible(False)
+        self.send_btn = QPushButton("Отправить")
+        self.send_btn.setObjectName("sendBtn")
+        self.send_btn.setEnabled(False)
+        self.send_btn.clicked.connect(self._on_send_clicked)
+        actions_row.addWidget(self.close_btn)
+        actions_row.addWidget(self.send_btn)
+        self.actions_row = actions_row
+        form.addLayout(actions_row)
+
+        self.filename_edit.returnPressed.connect(self.search_edit.setFocus)
+        self.search_edit.returnPressed.connect(self.send_btn.click)
+
+        self._progress_signal.connect(self._on_progress, Qt.QueuedConnection)
+        self._printers_signal.connect(self._on_printers_loaded, Qt.QueuedConnection)
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(5000)
+        self._refresh_timer.timeout.connect(self._start_fetch_printers)
+
+        self._start_fetch_printers(initial=True)
+
+    @staticmethod
+    def _field_label(text):
+        lbl = QLabel(text)
+        lbl.setObjectName("fieldLabel")
+        return lbl
+
+    # -- printer loading ----------------------------------------------------
+    def _start_fetch_printers(self, initial=False):
+        def worker():
+            try:
+                printers = fetch_printers()
+                self._printers_signal.emit(printers, "")
+            except Exception as e:
+                self._printers_signal.emit([], str(e))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_printers_loaded(self, printers, error):
+        if error and not self._loaded_once:
+            self.loading_label.setText(
+                "Не удалось получить список принтеров ScaleX (см. лог). Проверьте, что ScaleX запущен и доступен по сети.")
+            return
+        if error:
+            return  # a background refresh failed - keep showing the last known list, try again next tick
+
+        self._loaded_once = True
+        self.loading_label.setVisible(False)
+        self.form_widget.setVisible(True)
+
+        if self.machine_name:
+            self.machine_notice.setText("Нарезано под: %s" % self.machine_name)
+            self.machine_notice.setVisible(True)
+            self.match_only_cb.setVisible(True)
+
+        for p in printers:
+            pid = str(p.get("id"))
+            if pid in self.rows:
+                self.rows[pid].apply_data(p)
+            else:
+                # parent=self.scroll_contents matters here, not just as a
+                # style choice: a row created with no parent (the default)
+                # stays a genuine top-level widget until _render_list()
+                # below happens to insertWidget() it into list_layout - and
+                # that only happens for rows that pass the CURRENT filter.
+                # Most rows fail the default filters (match_only/
+                # online_only/hide_busy) on this very first load, so most
+                # rows were never inserted at all and stayed parentless -
+                # i.e. real, invisible, ever-growing top-level OS windows -
+                # for the rest of the picker's life. This was the actual
+                # majority contributor to the topLevelWidgets leak (the
+                # setParent(None) call removed elsewhere in this file was a
+                # second, smaller contributor on top of this one). Giving
+                # every row a real parent up front, before filtering ever
+                # runs, fixes it regardless of which rows are visible.
+                row = PrinterRowWidget(p, parent=self.scroll_contents)
+                row.on_selection_changed = self._update_selected_count
+                self.rows[pid] = row
+
+        self._render_list()
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    # -- filtering/rendering -------------------------------------------------
+    def _render_list(self):
+        if self.sending:
+            return
+        query = self.search_edit.text().strip().lower()
+        online_only = self.online_only_cb.isChecked()
+        hide_busy = self.hide_busy_cb.isChecked()
+        match_only = self.match_only_cb.isChecked() and self.match_only_cb.isVisible()
+
+        # remove everything but the trailing stretch, then re-add in sorted,
+        # filtered order - cheap (repositioning, not recreating) since rows
+        # are persistent widgets.
+        #
+        # IMPORTANT: only takeAt() here, never setParent(None). takeAt()
+        # detaches the widget from the LAYOUT but leaves its Qt parent
+        # (scroll_contents) untouched, which is what we want since rows not
+        # matching the current filter simply stay an un-laid-out child,
+        # invisible, still owned by scroll_contents. Calling setParent(None)
+        # on top of that clears the widget's parent entirely, which in Qt
+        # promotes it to an independent TOP-LEVEL WIDGET (a real, if
+        # invisible, OS window) instead of destroying it - since every row
+        # that fails the current filter (search text / online-only /
+        # hide-busy / match-only) is never re-inserted, it was orphaned
+        # forever as a phantom top-level window every single time
+        # _render_list() ran (every 5s printer refresh + every filter
+        # keystroke). That's what the topLevelWidgets() diagnostic dump
+        # caught: dozens of PrinterRowWidget(visible=False, size=640x480)
+        # entries (640x480 is Qt's default size for a parentless widget)
+        # accumulating without bound - explaining both the "~5 empty
+        # windows" flashes and the picker getting progressively slower to
+        # open. Fixed 2026-08-21.
+        while self.list_layout.count() > 1:
+            self.list_layout.takeAt(0)
+
+        ordered = sorted(self.rows.values(),
+                          key=lambda r: (r.printer.get("displayName") or r.printer.get("name") or "").lower())
+        for row in ordered:
+            visible = row.matches_filters(query, online_only, hide_busy, match_only, self.machine_name)
+            row.setVisible(visible)
+            if visible:
+                self.list_layout.insertWidget(self.list_layout.count() - 1, row)
+        self._update_selected_count()
+
+    def _select_all_visible(self):
+        for row in self.rows.values():
+            if row.isVisible():
+                row.checkbox.setChecked(True)
+
+    def _clear_all(self):
+        for row in self.rows.values():
+            row.checkbox.setChecked(False)
+
+    def _update_selected_count(self):
+        n = sum(1 for row in self.rows.values() if row.checkbox.isChecked())
+        self.selected_count_label.setText("Выбрано: %d" % n)
+        self.send_btn.setEnabled(n > 0 and not self.sending)
+
+    # -- sending --------------------------------------------------------------
+    def _on_send_clicked(self):
+        selected_ids = set()
+        targets = []
+        for pid, row in self.rows.items():
+            if not row.checkbox.isChecked():
+                continue
+            selected_ids.add(pid)
+            apply_rec = row.rec_row.isVisible() and row.rec_checkbox.isChecked()
+            targets.append({"printerId": pid, "applyRecommendations": apply_rec})
+        if not targets:
+            return
+
+        display_name = self.filename_edit.text().strip() or self.filename
+        src_ext = os.path.splitext(self.filename)[1]
+        if src_ext and not display_name.lower().endswith(src_ext.lower()):
+            display_name += src_ext
+        start_print = self.start_print_cb.isChecked()
+
+        self.sending = True
+        self._refresh_timer.stop()
+        self.filename_edit.setEnabled(False)
+        self.search_edit.setEnabled(False)
+        self.online_only_cb.setEnabled(False)
+        self.hide_busy_cb.setEnabled(False)
+        self.match_only_cb.setEnabled(False)
+        self.start_print_cb.setEnabled(False)
+        self.send_btn.setEnabled(False)
+        for w in (self.machine_notice,):
+            pass  # left visible, harmless
+
+        for pid, row in self.rows.items():
+            row.set_locked_for_send(pid in selected_ids)
+
+        logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s) ===",
+               self.filename, display_name, json.dumps(targets), start_print)
+
+        def report_cb(phase, percent, targets_out):
+            self._progress_signal.emit(phase, percent, targets_out)
+
+        send_in_background(self.file_path, targets, display_name=display_name,
+                            start_print=start_print, report_cb=report_cb)
+
+    def _on_progress(self, phase, percent, targets_out):
+        if not targets_out:
+            return
+        all_done = True
+        for t in targets_out:
+            row = self.rows.get(str(t["printerId"]))
+            if row:
+                row.set_mini_progress(t["phase"], t["percent"])
+            if t["phase"] not in ("done", "error"):
+                all_done = False
+        if all_done:
+            self.close_btn.setVisible(True)
+
+    def closeEvent(self, event):
+        logmsg("=== picker window closed: %s ===", self.filename)
+        try:
+            _open_windows.remove(self)
+        except ValueError:
+            pass
+        super().closeEvent(event)
+
+
+_open_windows = []  # keeps PickerWindow instances alive - Qt doesn't hold a Python reference on its own
+
+
+def open_picker_window(dest_path):
+    """Slot for AppController.file_captured - runs on the GUI thread (the
+    signal/slot connection below is queued whenever the emitting thread
+    differs from this one, e.g. handle_client()'s background thread), so
+    it's safe to create Qt widgets here."""
     filename = os.path.basename(dest_path)
     machine_name = extract_ctb_machine_name(dest_path)
-    with PENDING_LOCK:
-        PENDING[item_id] = {"file_path": dest_path, "filename": filename, "machine_name": machine_name}
-    url = "http://127.0.0.1:%d/?id=%s" % (HTTP_PORT, item_id)
-    logmsg("=== OPENING PICKER: %s (machine=%r) ===", url, machine_name)
-    open_app_window("Network sending — %s" % filename, url, item_id=item_id)
+    logmsg("=== OPENING PICKER: %s (machine=%r) ===", filename, machine_name)
+    win = PickerWindow(dest_path, filename, machine_name)
+    win.show()
+    force_window_to_foreground(win)
+    _open_windows.append(win)
 
+
+class AppController(QObject):
+    """Lives on the GUI thread; background threads (CHITUBOX protocol
+    handler, filesystem watcher) emit into file_captured instead of calling
+    open_picker_window directly, so window creation always happens on the
+    right thread regardless of which thread captured the file."""
+    file_captured = Signal(str)
+
+
+controller = None  # created in main(), before any background thread starts
+
+
+def _make_tray_icon():
+    pm = QPixmap(32, 32)
+    pm.fill(Qt.transparent)
+    from PySide6.QtGui import QPainter, QBrush
+    painter = QPainter(pm)
+    painter.setBrush(QBrush(QColor(COLOR_ACCENT)))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(2, 2, 28, 28)
+    painter.end()
+    return QIcon(pm)
+
+
+def _manual_send_dialog():
+    path, _ = QFileDialog.getOpenFileName(
+        None, "Выбрать файл для отправки", "",
+        "Слайс-файлы (*.ctb *.goo *.cbddlp *.pwmx);;Все файлы (*)")
+    if path:
+        open_picker_window(path)
+
+
+def build_tray_icon(app):
+    tray = QSystemTrayIcon(_make_tray_icon())
+    tray.setToolTip("own_manager - CHITUBOX -> ScaleX bridge")
+    menu = QMenu()
+    act_manual = QAction("Отправить файл вручную…")
+    act_manual.triggered.connect(_manual_send_dialog)
+    act_log = QAction("Открыть лог")
+    act_log.triggered.connect(lambda: os.startfile(LOG_PATH))
+    act_quit = QAction("Выход")
+    act_quit.triggered.connect(app.quit)
+    menu.addAction(act_manual)
+    menu.addAction(act_log)
+    menu.addSeparator()
+    menu.addAction(act_quit)
+    tray.setContextMenu(menu)
+    tray.activated.connect(
+        lambda reason: _manual_send_dialog() if reason == QSystemTrayIcon.DoubleClick else None)
+    tray.show()
+    return tray, menu, (act_manual, act_log, act_quit)  # keep refs alive - PySide6 doesn't on its own
 
 # ---------------------------------------------------------------------------
 # CHITUBOX TCP protocol - the real trigger. CHITUBOX itself understands a
@@ -1657,7 +1596,7 @@ def handle_client(conn, addr):
                         shutil.copy2(candidate, dest)
                         logmsg("=== CTB CAPTURED via direct request: %s -> %s (%d bytes) ===",
                                candidate, dest, os.path.getsize(dest))
-                        register_pending(dest)
+                        controller.file_captured.emit(dest)
                     except Exception as e:
                         logmsg("=== capture after SaveFile reply FAILED: %s (%s) ===", candidate, e)
                 else:
@@ -1733,7 +1672,7 @@ def slicer_file_watcher():
                             logmsg("=== SLICER FILE CAPTURE FAILED: %s (%s) ===", path, e)
                             continue
 
-                        register_pending(dest)
+                        controller.file_captured.emit(dest)
         except Exception as e:
             logmsg("=== slicer_file_watcher error: %s ===", e)
         time.sleep(POLL_INTERVAL_SEC)
@@ -1760,15 +1699,21 @@ def _chitubox_accept_loop(listen_sock):
 
 
 def main():
+    global controller
+
     logmsg("=== own_manager started PID=%d ===", os.getpid())
     logmsg("=== ScaleX: http://%s:%d ===", SCALEX_HOST, SCALEX_PORT)
 
-    start_http_server()
-    while HTTP_PORT == 0:
-        time.sleep(0.05)
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # tray-resident: closing every picker window must not exit the app
+    app.setStyleSheet(PICKER_QSS)
+
+    controller = AppController()
+    controller.file_captured.connect(open_picker_window, Qt.QueuedConnection)
+
+    tray, tray_menu, tray_actions = build_tray_icon(app)  # noqa: F841 - refs kept alive deliberately
 
     threading.Thread(target=slicer_file_watcher, daemon=True).start()
-    threading.Thread(target=_pending_cleanup_loop, daemon=True).start()
 
     listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1780,32 +1725,23 @@ def main():
     ok = create_shared_memory(SHM_NAME, str(port))
     logmsg("=== shared memory created=%s ===", "yes" if ok else "NO")
     if not ok:
-        print("FAILED to create shared memory segment - see log. Exiting.")
+        QMessageBox.critical(None, "own_manager", "Не удалось создать сегмент разделяемой памяти (см. лог). Выход.")
         return 1
 
     # CHITUBOX only ever opens one persistent connection - handling it in a
-    # background thread frees up the main thread for pywebview, which
-    # insists on owning it (webview.start() below blocks here forever).
+    # background thread frees up the main thread for Qt's event loop
+    # (app.exec() below blocks here for the process lifetime).
     threading.Thread(target=_chitubox_accept_loop, args=(listen_sock,), daemon=True).start()
 
-    # pywebview needs at least one window to exist before start() - this
-    # tiny hidden one just keeps its event loop alive; real picker windows
-    # get created on demand by open_app_window() from any thread once
-    # start() is running.
-    webview.create_window("own_manager", "about:blank", hidden=True, width=1, height=1)
-
-    print("own_manager running. Log: %s" % LOG_PATH)
-    print("Picker UI: http://127.0.0.1:%d/  (opens automatically on each capture)" % HTTP_PORT)
-    print("Close this window / Ctrl+C to stop (CHITUBOX will fall back to launching the real ChituManager).")
+    print("own_manager running (Qt). Log: %s" % LOG_PATH)
+    print("Picker windows open automatically on each capture; tray icon has manual send / log / exit.")
 
     try:
-        webview.start(debug=False)
-    except KeyboardInterrupt:
-        pass
+        ret = app.exec()
     finally:
         logmsg("=== own_manager exiting ===")
         _logf.close()
-    return 0
+    return ret
 
 
 if __name__ == "__main__":
