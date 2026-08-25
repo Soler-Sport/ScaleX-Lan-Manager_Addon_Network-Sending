@@ -892,9 +892,6 @@ QScrollArea { border: none; background: transparent; }
 #stateLabel[state="ready"] { color: %(green)s; font-size: 11px; font-weight: 600; }
 #stateLabel[state="busy"] { color: %(red)s; font-size: 11px; font-weight: 600; }
 #stateLabel[state="offline"] { color: %(dim)s; font-size: 11px; font-weight: 600; }
-#preparedBadge { font-size: 10.5px; border-radius: 4px; padding: 3px 7px; }
-#preparedBadge[prepared="true"] { color: %(green)s; background: rgba(115, 212, 154, .12); }
-#preparedBadge[prepared="false"] { color: %(dim)s; background: %(panel2)s; }
 #recSummary { color: %(dim)s; font-size: 11px; }
 #miniProgressLabel { color: %(dim)s; font-size: 11px; }
 QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 5px;
@@ -918,7 +915,26 @@ _BUSY_IDLE_TEXT = ("idle", "stopped", "complete", "completed")
 _BUSY_TEXT = ("preparing", "homing", "lifting", "exposing", "printing", "pausing", "paused", "stopping")
 
 
+def printer_is_uploading(p):
+    """True while ScaleX still has an active (non-final) upload job
+    targeting this printer - i.e. it's already receiving a file right now,
+    from someone else's send or a previous own_manager batch. printStatus
+    alone can still read "idle" for the whole transfer (the printer only
+    starts actually printing once the file has fully landed and, if
+    autoStart was set, ScaleX tells it to) - printer_is_busy() alone would
+    miss this entirely, so it's folded in below rather than requiring a
+    separate filter checkbox (per user request 2026-08-25 - same
+    "Скрывать занятые" toggle should cover it, ScaleX's own manager
+    exposes this exact state on every printer's "upload" field)."""
+    u = p.get("upload")
+    if not u:
+        return False
+    return not (u.get("done") or u.get("cancelled"))
+
+
 def printer_is_busy(p):
+    if printer_is_uploading(p):
+        return True
     s = p.get("status") or {}
     try:
         current_status = int(s.get("currentStatus") or 0)
@@ -982,8 +998,10 @@ class PrinterRowWidget(QFrame):
     def __init__(self, printer, parent=None):
         super().__init__(parent)
         self.setObjectName("printerRow")
+        self.setCursor(Qt.PointingHandCursor)
         self.printer_id = str(printer.get("id"))
         self.printer = printer
+        self._has_rec = False  # set for real by apply_data() below; only matters before that if something toggles early
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 8, 10, 8)
@@ -1009,6 +1027,16 @@ class PrinterRowWidget(QFrame):
         top.addWidget(self.state_label, 0, Qt.AlignTop)
         outer.addLayout(top)
 
+        # Purely informational labels must not swallow the click - Qt gives
+        # the deepest widget under the cursor first dibs at a mouse event
+        # and, unlike some event types, an ignored mouse press does NOT
+        # automatically bubble up to the parent - so without this, clicking
+        # directly on the printer name/meta/state text would do nothing
+        # instead of reaching mousePressEvent() below and toggling
+        # selection like clicking the empty background already does.
+        for lbl in (self.name_label, self.meta_label, self.state_label):
+            lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
         self.rec_row = QWidget()
         rec_layout = QHBoxLayout(self.rec_row)
         rec_layout.setContentsMargins(24, 0, 0, 0)
@@ -1019,15 +1047,6 @@ class PrinterRowWidget(QFrame):
         rec_layout.addWidget(self.rec_checkbox)
         rec_layout.addWidget(self.rec_summary_label, 1)
         outer.addWidget(self.rec_row)
-
-        self.prepared_badge = QLabel()
-        self.prepared_badge.setObjectName("preparedBadge")
-        self.prepared_badge.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        badge_row = QHBoxLayout()
-        badge_row.setContentsMargins(24, 0, 0, 0)
-        badge_row.addWidget(self.prepared_badge)
-        badge_row.addStretch(1)
-        outer.addLayout(badge_row)
 
         self.mini_progress = QProgressBar()
         self.mini_progress.setRange(0, 100)
@@ -1046,10 +1065,35 @@ class PrinterRowWidget(QFrame):
         self.on_selection_changed = None  # set by PickerWindow
         self.apply_data(printer)
 
-    def _on_checkbox_toggled(self, _checked):
-        self.setProperty("selected", "true" if self.checkbox.isChecked() else "false")
+    def mousePressEvent(self, event):
+        """Click-to-select: anywhere on the card toggles the same checkbox
+        as clicking the checkbox itself (per user request 2026-08-25) - the
+        checkbox and rec_checkbox keep their own normal click handling
+        since Qt routes a mouse event to the deepest widget under the
+        cursor first, and only an unclaimed click (background, or one of
+        the labels marked WA_TransparentForMouseEvents above) reaches
+        here."""
+        if event.button() == Qt.LeftButton and self.checkbox.isEnabled():
+            self.checkbox.toggle()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _on_checkbox_toggled(self, checked):
+        self.setProperty("selected", "true" if checked else "false")
         self.style().unpolish(self)
         self.style().polish(self)
+
+        # Recommendations only matter once you've actually chosen to send
+        # here, so keep them out of sight otherwise (per user request
+        # 2026-08-25) - and once a printer IS selected, apply its
+        # recommended exposure by default rather than making that an extra
+        # click every time; the checkbox stays a real override if someone
+        # wants to turn it back off for this send.
+        self.rec_row.setVisible(checked and self._has_rec)
+        if checked and self._has_rec:
+            self.rec_checkbox.setChecked(True)
+
         if self.on_selection_changed:
             self.on_selection_changed()
 
@@ -1064,10 +1108,19 @@ class PrinterRowWidget(QFrame):
         self.name_label.setText(str(name))
         self.meta_label.setText("%s — %s" % (model, ip) if model or ip else "")
 
+        prepared = printer.get("operatorPrepared") is True
         if not printer.get("status") or printer.get("status", {}).get("online") is False:
             state, text = "offline", "Оффлайн"
+        elif printer_is_uploading(printer):
+            state, text = "busy", "Загружается"
         elif printer_is_busy(printer):
             state, text = "busy", "Печатает"
+        elif prepared:
+            # Merged with the old separate "Принтер подготовлен" badge/row
+            # (per user request 2026-08-25) - "prepared" only has anything
+            # useful to add once the printer is otherwise available; folded
+            # into the same label instead of its own line.
+            state, text = "ready", "Доступен и подготовлен"
         else:
             state, text = "ready", "Доступен"
         self.state_label.setText(text)
@@ -1076,16 +1129,10 @@ class PrinterRowWidget(QFrame):
         self.state_label.style().polish(self.state_label)
 
         summary = printer_rec_summary(printer)
-        has_rec = bool(summary)
-        self.rec_row.setVisible(has_rec)
-        if has_rec:
+        self._has_rec = bool(summary)
+        if self._has_rec:
             self.rec_summary_label.setText(summary)
-
-        prepared = printer.get("operatorPrepared") is True
-        self.prepared_badge.setText("Принтер подготовлен" if prepared else "Не подтверждён")
-        self.prepared_badge.setProperty("prepared", "true" if prepared else "false")
-        self.prepared_badge.style().unpolish(self.prepared_badge)
-        self.prepared_badge.style().polish(self.prepared_badge)
+        self.rec_row.setVisible(self._has_rec and self.checkbox.isChecked())
 
     def matches_filters(self, query, online_only, hide_busy, match_only, detected_machine):
         if online_only and not printer_is_online(self.printer):
@@ -1251,19 +1298,26 @@ class PickerWindow(QMainWindow):
         self.scroll_area.setWidget(self.scroll_contents)
         form.addWidget(self.scroll_area, 1)
 
-        self.start_print_cb = QCheckBox("Запустить печать сразу после отправки")
-        form.addWidget(self.start_print_cb)
-
         actions_row = QHBoxLayout()
         actions_row.addStretch(1)
         self.close_btn = QPushButton("Закрыть окно")
         self.close_btn.clicked.connect(self.close)
         self.close_btn.setVisible(False)
-        self.send_btn = QPushButton("Отправить")
+        # Two explicit buttons instead of a "start print" checkbox modifying
+        # one Send button (per user request 2026-08-25) - a dedicated
+        # button for "upload and start printing immediately" makes that a
+        # deliberate, visible choice rather than something that quietly
+        # changes what the main button does depending on a checkbox state
+        # you might not notice you left checked from a previous send.
+        self.send_and_start_btn = QPushButton("Загрузить и запустить")
+        self.send_and_start_btn.setEnabled(False)
+        self.send_and_start_btn.clicked.connect(lambda: self._on_send_clicked(start_print=True))
+        self.send_btn = QPushButton("Загрузить")
         self.send_btn.setObjectName("sendBtn")
         self.send_btn.setEnabled(False)
-        self.send_btn.clicked.connect(self._on_send_clicked)
+        self.send_btn.clicked.connect(lambda: self._on_send_clicked(start_print=False))
         actions_row.addWidget(self.close_btn)
+        actions_row.addWidget(self.send_and_start_btn)
         actions_row.addWidget(self.send_btn)
         self.actions_row = actions_row
         form.addLayout(actions_row)
@@ -1397,9 +1451,10 @@ class PickerWindow(QMainWindow):
         n = sum(1 for row in self.rows.values() if row.checkbox.isChecked())
         self.selected_count_label.setText("Выбрано: %d" % n)
         self.send_btn.setEnabled(n > 0 and not self.sending)
+        self.send_and_start_btn.setEnabled(n > 0 and not self.sending)
 
     # -- sending --------------------------------------------------------------
-    def _on_send_clicked(self):
+    def _on_send_clicked(self, start_print):
         selected_ids = set()
         targets = []
         for pid, row in self.rows.items():
@@ -1415,7 +1470,6 @@ class PickerWindow(QMainWindow):
         src_ext = os.path.splitext(self.filename)[1]
         if src_ext and not display_name.lower().endswith(src_ext.lower()):
             display_name += src_ext
-        start_print = self.start_print_cb.isChecked()
 
         self.sending = True
         self._refresh_timer.stop()
@@ -1424,7 +1478,7 @@ class PickerWindow(QMainWindow):
         self.online_only_cb.setEnabled(False)
         self.hide_busy_cb.setEnabled(False)
         self.match_only_cb.setEnabled(False)
-        self.start_print_cb.setEnabled(False)
+        self.send_and_start_btn.setEnabled(False)
         self.send_btn.setEnabled(False)
         for w in (self.machine_notice,):
             pass  # left visible, harmless
