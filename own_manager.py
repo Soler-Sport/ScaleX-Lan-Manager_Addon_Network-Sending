@@ -727,6 +727,11 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             printers_by_id = {}
             logmsg("=== fetch_printers FAILED (send flow): %s ===", e)
 
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            file_size = None
+
         draft_id = [None]  # fetched lazily, only if some target actually needs a patch
         draft_lock = threading.Lock()
 
@@ -751,8 +756,8 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             all_done = all(v["phase"] in ("done", "error") for v in vals)
             any_error = any(v["phase"] == "error" for v in vals)
             phase = "error" if (all_done and any_error) else ("done" if all_done else "sending")
-            targets_out = [{"printerId": pid, "label": v["label"], "phase": v["phase"], "percent": v["percent"]}
-                           for pid, v in items]
+            targets_out = [{"printerId": pid, "label": v["label"], "phase": v["phase"], "percent": v["percent"],
+                             "errorReason": v.get("errorReason")} for pid, v in items]
             if report_cb:
                 report_cb(phase, percent, targets_out)
 
@@ -761,8 +766,34 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             printer = printers_by_id.get(str(pid), {})
             label = printer.get("displayName") or printer.get("name") or pid
             with tracker_lock:
-                tracker[pid] = {"label": label, "phase": "sending", "percent": 0.0}
+                tracker[pid] = {"label": label, "phase": "sending", "percent": 0.0, "errorReason": None}
             _report()
+
+            # Courtesy pre-check, not authoritative: remainingMemory is a
+            # snapshot from whenever fetch_printers() above ran, another
+            # job could still land on this printer between here and the
+            # real upload, so ScaleX's own rejection is still the final
+            # word either way - this just catches the common, obviously-
+            # doomed case up front without spending any time/bandwidth on
+            # a transfer that can't fit, and reports *why* instead of a
+            # generic error (per user request 2026-08-25). Skips the check
+            # entirely if remainingMemory isn't in this snapshot at all,
+            # rather than guessing.
+            if file_size is not None:
+                remaining = (printer.get("status") or {}).get("remainingMemory")
+                try:
+                    remaining = int(remaining) if remaining is not None else None
+                except (TypeError, ValueError):
+                    remaining = None
+                if remaining is not None and remaining < file_size:
+                    logmsg("=== SKIPPED %s: insufficient printer memory (remaining=%d bytes, file=%d bytes) ===",
+                           pid, remaining, file_size)
+                    with tracker_lock:
+                        tracker[pid]["phase"] = "error"
+                        tracker[pid]["percent"] = 100.0
+                        tracker[pid]["errorReason"] = "low_memory"
+                    _report()
+                    return
 
             def _cb(is_terminal, is_error, job_percent, message):
                 with tracker_lock:
@@ -986,6 +1017,10 @@ TARGET_PHASE_LABELS = {
     "error": "Ошибка",
 }
 
+ERROR_REASON_LABELS = {
+    "low_memory": "Недостаточно памяти на принтере",
+}
+
 
 class PrinterRowWidget(QFrame):
     """One printer card - persists for the printer's whole lifetime in this
@@ -1162,12 +1197,29 @@ class PrinterRowWidget(QFrame):
         self.mini_progress.setRange(0, 0)  # indeterminate
         self.mini_progress_label.setText("В очереди…")
 
-    def set_mini_progress(self, phase, percent):
+    def unlock_after_send(self, succeeded):
+        """Undoes set_locked_for_send() once a batch finishes, so the row
+        is interactive again instead of staying locked until the whole
+        window is closed (per user request 2026-08-25 - a per-printer
+        failure, e.g. not enough memory on that specific printer, should
+        be retryable from the same window instead of failing/blocking the
+        whole send). Failed rows stay checked so the very next click on
+        Загрузить/Загрузить и запустить resends just those; succeeded ones
+        get unchecked so a retry doesn't accidentally resend them too -
+        PickerWindow._render_list() (called right after this) decides
+        actual visibility from the filters as normal."""
+        self.checkbox.setEnabled(True)
+        self.rec_checkbox.setEnabled(True)
+        self.mini_progress_widget.setVisible(False)
+        if succeeded:
+            self.checkbox.setChecked(False)
+
+    def set_mini_progress(self, phase, percent, error_reason=None):
         if phase == "error":
             self.mini_progress.setRange(0, 100)
             self.mini_progress.setValue(100)
             self.mini_progress.setStyleSheet("QProgressBar::chunk { background: %s; }" % COLOR_RED)
-            self.mini_progress_label.setText("Ошибка")
+            self.mini_progress_label.setText(ERROR_REASON_LABELS.get(error_reason, "Ошибка"))
             return
         self.mini_progress.setStyleSheet("")
         if phase == "done":
@@ -1502,11 +1554,36 @@ class PickerWindow(QMainWindow):
         for t in targets_out:
             row = self.rows.get(str(t["printerId"]))
             if row:
-                row.set_mini_progress(t["phase"], t["percent"])
+                row.set_mini_progress(t["phase"], t["percent"], t.get("errorReason"))
             if t["phase"] not in ("done", "error"):
                 all_done = False
         if all_done:
             self.close_btn.setVisible(True)
+            self._enable_retry_for_errors(targets_out)
+
+    def _enable_retry_for_errors(self, targets_out):
+        """Once every selected printer has reached a terminal state, let
+        failures (insufficient printer memory, a rejected upload, whatever)
+        be retried immediately from this same window instead of forcing a
+        close-and-reopen-and-reselect-from-scratch (per user request
+        2026-08-25). No-op on a fully successful send - that just keeps
+        the existing "everything's locked, go press Закрыть окно" ending
+        unchanged."""
+        if not any(t["phase"] == "error" for t in targets_out):
+            return
+        for t in targets_out:
+            row = self.rows.get(str(t["printerId"]))
+            if row:
+                row.unlock_after_send(succeeded=(t["phase"] != "error"))
+        self.sending = False
+        self.filename_edit.setEnabled(True)
+        self.search_edit.setEnabled(True)
+        self.online_only_cb.setEnabled(True)
+        self.hide_busy_cb.setEnabled(True)
+        self.match_only_cb.setEnabled(True)
+        self._refresh_timer.start()
+        self._render_list()
+        self._update_selected_count()
 
     def closeEvent(self, event):
         logmsg("=== picker window closed: %s ===", self.filename)
