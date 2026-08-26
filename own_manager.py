@@ -123,8 +123,20 @@ except ImportError:
     AES = None
 
 ROOT_DIR = r"C:\own_manager"
-RECEIVED_DIR = os.path.join(ROOT_DIR, "received")  # local backup copy, always kept
+RECEIVED_DIR = os.path.join(ROOT_DIR, "received")  # local backup copy - see RECEIVED_RETENTION_DAYS below
 LOG_PATH = os.path.join(ROOT_DIR, "own_manager.log")
+
+# CTB files routinely run 300MB-900MB each, and every one gets a permanent
+# local copy in RECEIVED_DIR - on a farm doing several real sends a day
+# that fills the disk within days with no cleanup at all (confirmed live
+# 2026-08-26: down to 285MB free after a couple of days, on a 196GB
+# drive). RECEIVED_DIR is still genuinely useful for a while (resending,
+# checking what actually went out, debugging a failed send), just not
+# forever - _cleanup_old_captures() below removes anything older than
+# this on a periodic sweep. Bump this if you actually need a longer
+# window for re-sends/debugging.
+RECEIVED_RETENTION_DAYS = 3
+RETENTION_SWEEP_INTERVAL_SEC = 6 * 3600  # a slow-growing folder doesn't need checking often
 
 # Confirmed by a live capture on 2026-08-19: CHITUBOX writes the actual
 # sliced file here the instant a real "Send by network" completes - one
@@ -830,6 +842,18 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
                     with tracker_lock:
                         tracker[pid]["phase"] = "error"
                         tracker[pid]["percent"] = 100.0
+                        # 409 means ScaleX itself found the printer already
+                        # busy with something else at the moment it tried
+                        # to actually start the transfer - a real, live
+                        # conflict, not the same thing as the remainingMemory
+                        # pre-check above (confirmed live 2026-08-25: a
+                        # printer can pass the memory check and still get
+                        # 409'd seconds later because something else is
+                        # concurrently using it that own_manager's own
+                        # periodic snapshot never saw). Worth its own
+                        # message instead of a generic "Ошибка" so a retry
+                        # actually tells you something useful.
+                        tracker[pid]["errorReason"] = "conflict" if status == 409 else None
                     _report()
             except Exception as e:
                 logmsg("=== send-and-start FAILED for %s (%s) ===", pid, e)
@@ -925,6 +949,9 @@ QScrollArea { border: none; background: transparent; }
 #stateLabel[state="offline"] { color: %(dim)s; font-size: 11px; font-weight: 600; }
 #recSummary { color: %(dim)s; font-size: 11px; }
 #miniProgressLabel { color: %(dim)s; font-size: 11px; }
+#retryBtn { background: transparent; color: %(red)s; border: 1px solid %(red)s;
+    border-radius: 6px; padding: 2px 9px; font-size: 10.5px; font-weight: 600; }
+#retryBtn:hover { background: rgba(255, 126, 120, .12); }
 QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 5px;
     max-height: 8px; min-height: 8px; text-align: center; color: transparent; }
 QProgressBar::chunk { background: %(accent)s; border-radius: 5px; }
@@ -1019,7 +1046,10 @@ TARGET_PHASE_LABELS = {
 
 ERROR_REASON_LABELS = {
     "low_memory": "Недостаточно памяти на принтере",
+    "conflict": "Принтер сейчас занят другой задачей",
 }
+
+RETRY_COOLDOWN_MS = 800  # see set_mini_progress() below
 
 
 class PrinterRowWidget(QFrame):
@@ -1087,17 +1117,27 @@ class PrinterRowWidget(QFrame):
         self.mini_progress.setRange(0, 100)
         self.mini_progress_label = QLabel()
         self.mini_progress_label.setObjectName("miniProgressLabel")
+        self.retry_btn = QPushButton("Повторить")
+        self.retry_btn.setObjectName("retryBtn")
+        self.retry_btn.setVisible(False)
+        self.retry_btn.clicked.connect(self._on_retry_clicked)
+        mini_label_row = QHBoxLayout()
+        mini_label_row.setContentsMargins(0, 0, 0, 0)
+        mini_label_row.setSpacing(8)
+        mini_label_row.addWidget(self.mini_progress_label, 1)
+        mini_label_row.addWidget(self.retry_btn)
         mini_wrap = QVBoxLayout()
         mini_wrap.setContentsMargins(24, 2, 0, 0)
         mini_wrap.setSpacing(2)
         mini_wrap.addWidget(self.mini_progress)
-        mini_wrap.addWidget(self.mini_progress_label)
+        mini_wrap.addLayout(mini_label_row)
         self.mini_progress_widget = QWidget()
         self.mini_progress_widget.setLayout(mini_wrap)
         self.mini_progress_widget.setVisible(False)
         outer.addWidget(self.mini_progress_widget)
 
         self.on_selection_changed = None  # set by PickerWindow
+        self.on_retry_requested = None  # set by PickerWindow
         self.apply_data(printer)
 
     def mousePressEvent(self, event):
@@ -1113,6 +1153,16 @@ class PrinterRowWidget(QFrame):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def _on_retry_clicked(self):
+        # Belt-and-braces on top of the cooldown in set_mini_progress()
+        # below: set_locked_for_send() (called synchronously inside
+        # _retry_single, before any network/thread activity) already hides
+        # this button, but disabling it here too closes the gap between
+        # this click and that happening.
+        self.retry_btn.setEnabled(False)
+        if self.on_retry_requested:
+            self.on_retry_requested(self.printer_id)
 
     def _on_checkbox_toggled(self, checked):
         self.setProperty("selected", "true" if checked else "false")
@@ -1193,29 +1243,52 @@ class PrinterRowWidget(QFrame):
             return
         self.checkbox.setEnabled(False)
         self.rec_checkbox.setEnabled(False)
+        self.retry_btn.setVisible(False)
         self.mini_progress_widget.setVisible(True)
         self.mini_progress.setRange(0, 0)  # indeterminate
         self.mini_progress_label.setText("В очереди…")
 
     def unlock_after_send(self, succeeded):
-        """Undoes set_locked_for_send() once a batch finishes, so the row
-        is interactive again instead of staying locked until the whole
-        window is closed (per user request 2026-08-25 - a per-printer
-        failure, e.g. not enough memory on that specific printer, should
-        be retryable from the same window instead of failing/blocking the
-        whole send). Failed rows stay checked so the very next click on
-        Загрузить/Загрузить и запустить resends just those; succeeded ones
-        get unchecked so a retry doesn't accidentally resend them too -
-        PickerWindow._render_list() (called right after this) decides
-        actual visibility from the filters as normal."""
+        """Undoes set_locked_for_send() once a row reaches a terminal state
+        (per user request 2026-08-25 - a per-printer failure, e.g. not
+        enough memory on that specific printer, should be retryable
+        without closing/reopening the picker). On success: hide the
+        progress row entirely and uncheck, exactly like before this
+        existed. On failure: leave the progress row (with its error
+        message and the Retry button set_mini_progress just armed) fully
+        visible instead of hiding it - that button, not this method, is
+        now the primary way to act on the failure, so nothing here should
+        make it disappear. Checkbox/rec_checkbox re-enable either way so
+        the row isn't stuck locked forever even if the user never clicks
+        Retry and instead just wants to deselect it."""
         self.checkbox.setEnabled(True)
         self.rec_checkbox.setEnabled(True)
-        self.mini_progress_widget.setVisible(False)
         if succeeded:
+            self.mini_progress_widget.setVisible(False)
             self.checkbox.setChecked(False)
 
+    def _rearm_retry_btn(self):
+        # Only matters if the row is still actually showing an error -
+        # if it moved on (succeeded on a later retry, got deselected,
+        # whatever) in the meantime, retry_btn is already hidden and this
+        # is a harmless no-op.
+        if self.retry_btn.isVisible():
+            self.retry_btn.setEnabled(True)
+
     def set_mini_progress(self, phase, percent, error_reason=None):
+        self.retry_btn.setVisible(phase == "error")
         if phase == "error":
+            # Confirmed live 2026-08-25: a memory/conflict pre-check that
+            # fails is near-instant (no real network round trip), so
+            # without a cooldown the button reappears fast enough that a
+            # user tapping it again out of reflex creates a visible rapid
+            # show/hide flicker on the whole row ("мигал как ебнутый") -
+            # 6+ retries logged inside one second. Keeping it visible (so
+            # the error text is readable right away) but disabled for a
+            # beat gives a calmer, legible state and stops that loop
+            # without making a genuinely-ready retry wait any real time.
+            self.retry_btn.setEnabled(False)
+            QTimer.singleShot(RETRY_COOLDOWN_MS, self._rearm_retry_btn)
             self.mini_progress.setRange(0, 100)
             self.mini_progress.setValue(100)
             self.mini_progress.setStyleSheet("QProgressBar::chunk { background: %s; }" % COLOR_RED)
@@ -1244,6 +1317,7 @@ class PickerWindow(QMainWindow):
 
     _progress_signal = Signal(str, object, list)   # phase, percent(float|None), targets(list[dict])
     _printers_signal = Signal(list, str)           # printers, error message ("" if ok)
+    _retry_signal = Signal(list)                   # targets(list[dict]) - one row's own retry, not the whole-batch state
 
     def __init__(self, file_path, filename, machine_name):
         super().__init__()
@@ -1253,6 +1327,8 @@ class PickerWindow(QMainWindow):
         self.rows = {}       # printer_id -> PrinterRowWidget
         self.sending = False
         self._loaded_once = False
+        self._last_display_name = None  # set by _on_send_clicked, reused by a single-row retry
+        self._last_start_print = False
 
         self.setWindowTitle("Network sending — %s" % filename)
         self.resize(760, 820)
@@ -1379,6 +1455,7 @@ class PickerWindow(QMainWindow):
 
         self._progress_signal.connect(self._on_progress, Qt.QueuedConnection)
         self._printers_signal.connect(self._on_printers_loaded, Qt.QueuedConnection)
+        self._retry_signal.connect(self._on_retry_progress, Qt.QueuedConnection)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(5000)
@@ -1441,6 +1518,7 @@ class PickerWindow(QMainWindow):
                 # runs, fixes it regardless of which rows are visible.
                 row = PrinterRowWidget(p, parent=self.scroll_contents)
                 row.on_selection_changed = self._update_selected_count
+                row.on_retry_requested = self._retry_single
                 self.rows[pid] = row
 
         self._render_list()
@@ -1522,6 +1600,8 @@ class PickerWindow(QMainWindow):
         src_ext = os.path.splitext(self.filename)[1]
         if src_ext and not display_name.lower().endswith(src_ext.lower()):
             display_name += src_ext
+        self._last_display_name = display_name  # reused by a later single-row retry
+        self._last_start_print = start_print
 
         self.sending = True
         self._refresh_timer.stop()
@@ -1584,6 +1664,51 @@ class PickerWindow(QMainWindow):
         self._refresh_timer.start()
         self._render_list()
         self._update_selected_count()
+
+    def _retry_single(self, pid):
+        """Wired to every row's on_retry_requested - fires the moment that
+        one row's own Retry button is clicked, independent of whether the
+        rest of the original batch is still in flight (per user request
+        2026-08-25: the row shouldn't have to wait for every other printer
+        to finish before it becomes actionable). Reuses whatever filename/
+        startPrint the original send used; re-reads applyRecommendations
+        fresh off the row in case the user toggled it since. Deliberately
+        does NOT touch self.sending or the top-level controls the way a
+        full send does - this is a small, single-row side operation that
+        can run concurrently with (or standalone from) anything else."""
+        row = self.rows.get(pid)
+        if not row:
+            return
+        apply_rec = row.rec_row.isVisible() and row.rec_checkbox.isChecked()
+        target = {"printerId": pid, "applyRecommendations": apply_rec}
+        display_name = self._last_display_name or self.filename
+        start_print = self._last_start_print
+
+        row.set_locked_for_send(True)
+        logmsg("=== PICKER: retrying %s -> %s (startPrint=%s) ===", self.filename, pid, start_print)
+
+        def report_cb(phase, percent, targets_out):
+            self._retry_signal.emit(targets_out)
+
+        send_in_background(self.file_path, [target], display_name=display_name,
+                            start_print=start_print, report_cb=report_cb)
+
+    def _on_retry_progress(self, targets_out):
+        for t in targets_out:
+            row = self.rows.get(str(t["printerId"]))
+            if not row:
+                continue
+            row.set_mini_progress(t["phase"], t["percent"], t.get("errorReason"))
+            if t["phase"] == "done":
+                row.unlock_after_send(succeeded=True)
+            elif t["phase"] == "error":
+                # Leave the progress row (error text + re-armed Retry
+                # button, both just set by set_mini_progress above)
+                # visible - only re-enable the checkbox so the row isn't
+                # otherwise stuck locked if they'd rather deselect it than
+                # retry again.
+                row.checkbox.setEnabled(True)
+                row.rec_checkbox.setEnabled(True)
 
     def closeEvent(self, event):
         logmsg("=== picker window closed: %s ===", self.filename)
@@ -1764,6 +1889,18 @@ def handle_client(conn, addr):
                         shutil.copy2(candidate, dest)
                         logmsg("=== CTB CAPTURED via direct request: %s -> %s (%d bytes) ===",
                                candidate, dest, os.path.getsize(dest))
+                        # candidate (in PENDING_DIR) was only ever a staging
+                        # copy for CHITUBOX to write into - dest (in
+                        # RECEIVED_DIR) is the real, permanent one. Nothing
+                        # ever reads it again once this copy has succeeded,
+                        # so leaving it in place just double-counts every
+                        # capture's disk footprint for no reason - remove
+                        # it right away instead of letting it sit there
+                        # forever like RECEIVED_DIR used to.
+                        try:
+                            os.remove(candidate)
+                        except OSError as e:
+                            logmsg("=== failed to remove PENDING copy %s after capture: %s ===", candidate, e)
                         controller.file_captured.emit(dest)
                     except Exception as e:
                         logmsg("=== capture after SaveFile reply FAILED: %s (%s) ===", candidate, e)
@@ -1846,6 +1983,48 @@ def slicer_file_watcher():
         time.sleep(POLL_INTERVAL_SEC)
 
 
+# ---------------------------------------------------------------------------
+# Disk cleanup - RECEIVED_DIR is a real backup of every file ever sent, kept
+# around for a while (resending, checking what went out, debugging a failed
+# send) but not forever; PENDING_DIR should be near-empty already now that
+# handle_client() removes its own staging copies right after use, but this
+# also mops up anything left over from before that fix, or from any future
+# case where that immediate delete fails. See RECEIVED_RETENTION_DAYS above.
+# ---------------------------------------------------------------------------
+def _cleanup_old_captures():
+    cutoff = time.time() - RECEIVED_RETENTION_DAYS * 86400
+    total_removed = 0
+    total_freed = 0
+    for d in (RECEIVED_DIR, PENDING_DIR):
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            try:
+                if not os.path.isfile(path):
+                    continue
+                st = os.stat(path)
+                if st.st_mtime < cutoff:
+                    size = st.st_size
+                    os.remove(path)
+                    total_removed += 1
+                    total_freed += size
+            except OSError as e:
+                logmsg("=== _cleanup_old_captures: failed to remove %s: %s ===", path, e)
+    if total_removed:
+        logmsg("=== _cleanup_old_captures: removed %d file(s), freed %.1f MB (older than %d days) ===",
+               total_removed, total_freed / (1024 * 1024), RECEIVED_RETENTION_DAYS)
+
+
+def _received_dir_cleanup_loop():
+    while True:
+        try:
+            _cleanup_old_captures()
+        except Exception as e:
+            logmsg("=== _received_dir_cleanup_loop error: %s ===", e)
+        time.sleep(RETENTION_SWEEP_INTERVAL_SEC)
+
+
 def _chitubox_accept_loop(listen_sock):
     while True:
         try:
@@ -1898,6 +2077,7 @@ def main():
     tray, tray_menu, tray_actions = build_tray_icon(app)  # noqa: F841 - refs kept alive deliberately
 
     threading.Thread(target=slicer_file_watcher, daemon=True).start()
+    threading.Thread(target=_received_dir_cleanup_loop, daemon=True).start()
 
     listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
