@@ -2092,17 +2092,36 @@ def _chitubox_accept_loop(listen_sock):
         except Exception as e:
             logmsg("=== CHITUBOX accept() FAILED, listener socket is likely dead: %s ===", e)
             return
-        try:
-            handle_client(conn, addr)
-        except Exception as e:
-            # A single bad connection (CHITUBOX closed unexpectedly, a
-            # malformed message, whatever) must not take down the whole
-            # listener - this used to be one try/except wrapping the
-            # entire while loop, so any exception out of handle_client
-            # silently ended the thread and CHITUBOX could never connect
-            # again until a manual restart, with only one easy-to-miss log
-            # line to explain why.
-            logmsg("=== handle_client FAILED for %s:%d, listener stays up: %s ===", addr[0], addr[1], e)
+
+        # handle_client() used to run right here, synchronously, blocking
+        # this accept() loop for as long as that one connection stayed
+        # open - fine for the normal case (CHITUBOX keeps one persistent
+        # connection for its whole runtime), but it meant a connection
+        # that went stale WITHOUT a clean close (CHITUBOX crashed, the
+        # machine slept/resumed, a network blip) left conn.recv() blocked
+        # forever on a peer that no longer exists, and the listener could
+        # never accept() a new connection again - own_manager would go
+        # completely deaf until manually restarted. Confirmed live
+        # 2026-08-27: "Отправка по сети" stopped opening the picker
+        # entirely (the slicer_file_watcher backstop still worked fine,
+        # since it doesn't touch this socket at all) - exactly this
+        # failure mode, flagged as a known gap back when this loop was
+        # first reviewed but not fixed until it actually happened. Each
+        # connection now gets its own thread so accept() is always free to
+        # take the next one immediately, however long (or however dead)
+        # any previous connection turns out to be. handle_client() only
+        # ever touches its own local state per call, nothing shared that
+        # would need a lock across connections.
+        def _serve(conn=conn, addr=addr):
+            try:
+                handle_client(conn, addr)
+            except Exception as e:
+                # A single bad connection (CHITUBOX closed unexpectedly, a
+                # malformed message, whatever) must not take down the
+                # whole listener.
+                logmsg("=== handle_client FAILED for %s:%d: %s ===", addr[0], addr[1], e)
+
+        threading.Thread(target=_serve, daemon=True).start()
 
 
 def main():
