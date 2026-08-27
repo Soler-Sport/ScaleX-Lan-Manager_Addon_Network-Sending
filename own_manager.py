@@ -621,6 +621,30 @@ def patch_and_upload_single(draft_id, printer_id, patch, auto_start):
         conn.close()
 
 
+def start_stored_file(printer_id, path, queue_if_not_prepared):
+    """POST /api/printers/{id}/stored-files/start {path, queueIfNotPrepared} -
+    ScaleX's own two-step mechanism (confirmed via its own app.js,
+    2026-08-27) for starting a file that's already been uploaded to a
+    printer's local storage. With queueIfNotPrepared=True, ScaleX accepts
+    the request even if the printer isn't marked operatorPrepared yet and
+    holds the actual print start until an operator confirms it - this is
+    what "ожидание подготовки" in ScaleX's own UI actually is, distinct
+    from either starting blind or refusing outright. Without it (False),
+    an unprepared printer makes this endpoint fail with
+    {"error":"printer_not_prepared"} (non-2xx) - same shape send_in_background
+    checks for below."""
+    conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=30)
+    try:
+        body = json.dumps({"path": path, "queueIfNotPrepared": bool(queue_if_not_prepared)}).encode("utf-8")
+        conn.request("POST", "/api/printers/%s/stored-files/start" % urllib.parse.quote(str(printer_id), safe=""),
+                      body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        return resp.status, resp_body
+    finally:
+        conn.close()
+
+
 def forward_to_scalex_with_recommendations(file_path, targets, display_name=None):
     """Preferred path: targets = [{"printerId": id, "applyRecommendations": bool}, ...].
     Uses the CTB-draft flow so each printer marked applyRecommendations
@@ -641,9 +665,14 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
     """Generic poller for GET {path} - works for both /api/uploads/{id} and
     /api/bulk-uploads/{id} as long as the response has a "done" bool.
     progress_cb, if given, is called on every tick as
-    progress_cb(is_terminal, is_error, job_percent_0_100_or_None, message) -
-    lets a caller polling several printers concurrently (see
-    send_in_background) aggregate them itself and report to its own GUI."""
+    progress_cb(is_terminal, is_error, job_percent_0_100_or_None, message,
+    raw_status_dict) - lets a caller polling several printers concurrently
+    (see send_in_background) aggregate them itself and report to its own
+    GUI. raw_status_dict is the full parsed response, mainly so a caller
+    can pull fields the flat (percent, message) summary doesn't carry -
+    e.g. lastUploadedPath, which patch-and-upload's own initial 202
+    response doesn't include at all (confirmed live 2026-08-27) but the
+    polled status does once the upload actually starts moving."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=15)
@@ -654,7 +683,7 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
         except Exception as e:
             logmsg("=== upload status check failed for %s (%s): %s ===", filename, path, e)
             if progress_cb:
-                progress_cb(True, True, None, "Не удалось получить статус: %s" % e)
+                progress_cb(True, True, None, "Не удалось получить статус: %s" % e, {})
             return
         finally:
             conn.close()
@@ -663,7 +692,7 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
         except Exception:
             logmsg("=== upload status for %s: non-JSON response, giving up polling ===", filename)
             if progress_cb:
-                progress_cb(True, False, 100.0, "")
+                progress_cb(True, False, 100.0, "", {})
             return
 
         # Two shapes seen live: /api/uploads/{id} has an explicit "done"
@@ -677,14 +706,14 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
         if job_percent is None:
             job_percent = 100.0 if (is_terminal and not is_error) else None
         if progress_cb:
-            progress_cb(is_terminal, is_error, job_percent, message)
+            progress_cb(is_terminal, is_error, job_percent, message, status)
         if is_terminal:
             logmsg("=== UPLOAD STATUS %s: %s ===", filename, json.dumps(status)[:500])
             return
         time.sleep(interval_sec)
     logmsg("=== upload status poll timed out for %s ===", filename)
     if progress_cb:
-        progress_cb(True, True, None, "Тайм-аут ожидания статуса")
+        progress_cb(True, True, None, "Тайм-аут ожидания статуса", {})
 
 
 def send_in_background(file_path, targets, display_name=None, start_print=False, report_cb=None):
@@ -693,7 +722,14 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
     name on disk) - lets the picker page rename the file before sending,
     same idea as ChituManager's own editable filename field.
     start_print: whether to actually start printing once each transfer
-    lands (X-Start-Print / autoStart).
+    lands (X-Start-Print / autoStart) - but only actually sent as such to
+    printers that are operatorPrepared; for one that isn't, _send_one()
+    below uploads without starting and instead registers the start via
+    ScaleX's own queueIfNotPrepared mechanism (start_stored_file()) so it
+    fires automatically once an operator confirms preparation, rather
+    than starting blind on an unconfirmed printer or silently dropping
+    the "start" request the picker was told to honor (per user request
+    2026-08-27).
 
     ALWAYS dispatches per-printer, in parallel, through the same
     single-printer endpoints ScaleX's own normal upload UI uses
@@ -765,7 +801,7 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             vals = [v for _, v in items]
             pcts = [v["percent"] for v in vals if v["percent"] is not None]
             percent = (sum(pcts) / len(pcts)) if pcts else None
-            all_done = all(v["phase"] in ("done", "error") for v in vals)
+            all_done = all(v["phase"] in ("done", "queued_prepared", "error") for v in vals)
             any_error = any(v["phase"] == "error" for v in vals)
             phase = "error" if (all_done and any_error) else ("done" if all_done else "sending")
             targets_out = [{"printerId": pid, "label": v["label"], "phase": v["phase"], "percent": v["percent"],
@@ -807,7 +843,58 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
                     _report()
                     return
 
-            def _cb(is_terminal, is_error, job_percent, message):
+            # If a start was requested but this printer isn't marked
+            # operatorPrepared, don't send X-Start-Print/autoStart=true
+            # blindly (per user request 2026-08-27) - upload without
+            # starting, then register the start through ScaleX's own
+            # two-step "queue until prepared" mechanism instead
+            # (start_stored_file(..., queue_if_not_prepared=True) below),
+            # confirmed via its own app.js: same thing its own UI does
+            # when you try to start an unprepared printer and choose to
+            # queue it rather than cancel. A printer that IS prepared is
+            # completely unaffected - same single-request flow as before.
+            printer_prepared = printer.get("operatorPrepared") is True
+            needs_deferred_start = bool(start_print) and not printer_prepared
+            effective_start_print = bool(start_print) and not needs_deferred_start
+            uploaded_path = [None]  # filled in once the initial request's own response is parsed below
+
+            def _register_deferred_start():
+                path = uploaded_path[0]
+                if not path:
+                    logmsg("=== %s: can't register deferred start, no lastUploadedPath in the upload response ===", pid)
+                    with tracker_lock:
+                        tracker[pid]["phase"] = "error"
+                        tracker[pid]["percent"] = 100.0
+                    _report()
+                    return
+                try:
+                    qstatus, qbody = start_stored_file(pid, path, queue_if_not_prepared=True)
+                except Exception as e:
+                    logmsg("=== %s: deferred start request FAILED: %s ===", pid, e)
+                    with tracker_lock:
+                        tracker[pid]["phase"] = "error"
+                        tracker[pid]["percent"] = 100.0
+                    _report()
+                    return
+                logmsg("=== DEFERRED START (queueIfNotPrepared) -> %s: HTTP %d: %s ===",
+                       pid, qstatus, qbody[:300].decode("utf-8", "replace"))
+                with tracker_lock:
+                    tracker[pid]["phase"] = "queued_prepared" if 200 <= qstatus < 300 else "error"
+                    tracker[pid]["percent"] = 100.0
+                _report()
+
+            def _cb(is_terminal, is_error, job_percent, message, status):
+                # patch-and-upload's own initial 202 response never carries
+                # lastUploadedPath at all (confirmed live 2026-08-27 - only
+                # the plain/unpatched upload's initial response does) but
+                # the polled status does once ScaleX actually has it, so
+                # keep grabbing it on every tick rather than relying on the
+                # initial response alone.
+                if status.get("lastUploadedPath"):
+                    uploaded_path[0] = status["lastUploadedPath"]
+                if is_terminal and not is_error and needs_deferred_start:
+                    _register_deferred_start()
+                    return
                 with tracker_lock:
                     tracker[pid]["phase"] = "error" if is_error else ("done" if is_terminal else "sending")
                     if job_percent is not None:
@@ -817,21 +904,25 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             patch = build_recommendation_patch(printer) if (t.get("applyRecommendations") and has_recommendations(printer)) else {}
             try:
                 if patch:
-                    status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, start_print)
-                    logmsg("=== PATCH+UPLOAD (startPrint=%s) -> %s: HTTP %d: %s ===",
-                           start_print, pid, status, resp_body[:400].decode("utf-8", "replace"))
+                    status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, effective_start_print)
+                    logmsg("=== PATCH+UPLOAD (startPrint=%s, deferred=%s) -> %s: HTTP %d: %s ===",
+                           effective_start_print, needs_deferred_start, pid, status, resp_body[:400].decode("utf-8", "replace"))
                 else:
                     # Timings already fine for this printer (or no
                     # recommendations to apply) - skip the rewrite, send
                     # the file as-is.
-                    status, resp_body = forward_to_scalex(file_path, pid, display_name=name, start_print=start_print)
+                    status, resp_body = forward_to_scalex(file_path, pid, display_name=name, start_print=effective_start_print)
                 if 200 <= status < 300:
                     try:
-                        upload_id = json.loads(resp_body.decode("utf-8", "replace")).get("uploadId")
+                        initial_json = json.loads(resp_body.decode("utf-8", "replace"))
                     except Exception:
-                        upload_id = None
+                        initial_json = {}
+                    upload_id = initial_json.get("uploadId")
+                    uploaded_path[0] = initial_json.get("lastUploadedPath")
                     if upload_id:
                         poll_scalex_upload("/api/uploads/%s" % upload_id, name, progress_cb=_cb)
+                    elif needs_deferred_start:
+                        _register_deferred_start()
                     else:
                         with tracker_lock:
                             tracker[pid]["phase"] = "done"
@@ -1356,6 +1447,17 @@ class PrinterRowWidget(QFrame):
             self.mini_progress.setValue(100)
             self.mini_progress_label.setText("Готово")
             return
+        if phase == "queued_prepared":
+            # Uploaded, but start was deliberately deferred (printer
+            # wasn't operatorPrepared) - registered via ScaleX's own
+            # queueIfNotPrepared mechanism instead of starting blind or
+            # not starting at all (per user request 2026-08-27). ScaleX
+            # itself starts the print once an operator marks the printer
+            # prepared - nothing more for own_manager to do here.
+            self.mini_progress.setRange(0, 100)
+            self.mini_progress.setValue(100)
+            self.mini_progress_label.setText("Загружено — старт назначен, ждём подтверждения подготовки")
+            return
         if percent is None:
             self.mini_progress.setRange(0, 0)
         else:
@@ -1695,7 +1797,7 @@ class PickerWindow(QMainWindow):
             row = self.rows.get(str(t["printerId"]))
             if row:
                 row.set_mini_progress(t["phase"], t["percent"], t.get("errorReason"))
-            if t["phase"] not in ("done", "error"):
+            if t["phase"] not in ("done", "queued_prepared", "error"):
                 all_done = False
         if all_done:
             self.close_btn.setVisible(True)
@@ -1759,7 +1861,7 @@ class PickerWindow(QMainWindow):
             if not row:
                 continue
             row.set_mini_progress(t["phase"], t["percent"], t.get("errorReason"))
-            if t["phase"] == "done":
+            if t["phase"] in ("done", "queued_prepared"):
                 row.unlock_after_send(succeeded=True)
             elif t["phase"] == "error":
                 # Leave the progress row (error text + re-armed Retry
