@@ -944,6 +944,9 @@ QScrollArea { border: none; background: transparent; }
 #printerRow[selected="true"] { border: 1px solid rgba(232, 255, 101, .65); background: rgba(232, 255, 101, .06); }
 #printerName { color: %(text)s; font-size: 12.5px; font-weight: 700; }
 #printerMeta { color: %(dim)s; font-size: 11.5px; }
+#memoryFitLabel { font-size: 11px; margin-top: 1px; }
+#memoryFitLabel[fit="yes"] { color: %(green)s; }
+#memoryFitLabel[fit="no"] { color: %(red)s; font-weight: 600; }
 #stateLabel[state="ready"] { color: %(green)s; font-size: 11px; font-weight: 600; }
 #stateLabel[state="busy"] { color: %(red)s; font-size: 11px; font-weight: 600; }
 #stateLabel[state="offline"] { color: %(dim)s; font-size: 11px; font-weight: 600; }
@@ -971,6 +974,36 @@ QProgressBar::chunk { background: %(accent)s; border-radius: 5px; }
 # ---------------------------------------------------------------------------
 _BUSY_IDLE_TEXT = ("idle", "stopped", "complete", "completed")
 _BUSY_TEXT = ("preparing", "homing", "lifting", "exposing", "printing", "pausing", "paused", "stopping")
+
+
+def _format_bytes(n):
+    if n >= 1024 ** 3:
+        return "%.1f ГБ" % (n / 1024 ** 3)
+    return "%.0f МБ" % (n / 1024 ** 2)
+
+
+def printer_memory_fit(printer, file_size):
+    """(fits: bool, text: str) for whether `file_size` bytes should fit in
+    this printer's currently-reported free space, or None if
+    remainingMemory isn't in this printer's data at all (some firmware/
+    older printers may not report it - stay silent rather than guess).
+    Purely informational/proactive (per user request 2026-08-26, replacing
+    the old select-send-fail-retry discovery flow) - send_in_background's
+    own pre-check right before actually dispatching is the real, final
+    word; this can be a few seconds stale by the time someone clicks
+    Send."""
+    if file_size is None:
+        return None
+    remaining = (printer.get("status") or {}).get("remainingMemory")
+    try:
+        remaining = int(remaining) if remaining is not None else None
+    except (TypeError, ValueError):
+        remaining = None
+    if remaining is None:
+        return None
+    if remaining >= file_size:
+        return True, "Поместится (свободно %s)" % _format_bytes(remaining)
+    return False, "Не хватит места (нужно %s, свободно %s)" % (_format_bytes(file_size), _format_bytes(remaining))
 
 
 def printer_is_uploading(p):
@@ -1060,12 +1093,13 @@ class PrinterRowWidget(QFrame):
     on every re-render; a native widget just gets hidden/shown/repositioned
     instead, so nothing needs to remember what was checked)."""
 
-    def __init__(self, printer, parent=None):
+    def __init__(self, printer, parent=None, file_size=None):
         super().__init__(parent)
         self.setObjectName("printerRow")
         self.setCursor(Qt.PointingHandCursor)
         self.printer_id = str(printer.get("id"))
         self.printer = printer
+        self.file_size = file_size  # the picker's own file, in bytes - see memory_fit_label below
         self._has_rec = False  # set for real by apply_data() below; only matters before that if something toggles early
 
         outer = QVBoxLayout(self)
@@ -1083,8 +1117,21 @@ class PrinterRowWidget(QFrame):
         self.name_label.setObjectName("printerName")
         self.meta_label = QLabel()
         self.meta_label.setObjectName("printerMeta")
+        # Shows up front, for every card, whether THIS file should fit on
+        # THIS printer's currently-reported free space - refreshed on the
+        # same 5s cycle as everything else in apply_data() below. Replaces
+        # relying on select-send-fail-retry to find out (per user request
+        # 2026-08-26: that reactive flow was confusing/felt buggy even
+        # after the debounce fix). send_in_background's own pre-check
+        # right before actually dispatching is left in place as a last-
+        # moment safety net - the printer's real free space can still
+        # change in the few seconds between a refresh and an actual send.
+        self.memory_fit_label = QLabel()
+        self.memory_fit_label.setObjectName("memoryFitLabel")
+        self.memory_fit_label.setVisible(False)
         names.addWidget(self.name_label)
         names.addWidget(self.meta_label)
+        names.addWidget(self.memory_fit_label)
         top.addLayout(names, 1)
 
         self.state_label = QLabel()
@@ -1099,7 +1146,7 @@ class PrinterRowWidget(QFrame):
         # directly on the printer name/meta/state text would do nothing
         # instead of reaching mousePressEvent() below and toggling
         # selection like clicking the empty background already does.
-        for lbl in (self.name_label, self.meta_label, self.state_label):
+        for lbl in (self.name_label, self.meta_label, self.state_label, self.memory_fit_label):
             lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
         self.rec_row = QWidget()
@@ -1192,6 +1239,15 @@ class PrinterRowWidget(QFrame):
         ip = printer.get("currentIp") or printer.get("ipAddress") or ""
         self.name_label.setText(str(name))
         self.meta_label.setText("%s — %s" % (model, ip) if model or ip else "")
+
+        fit = printer_memory_fit(printer, self.file_size)
+        self.memory_fit_label.setVisible(fit is not None)
+        if fit is not None:
+            fits, fit_text = fit
+            self.memory_fit_label.setText(fit_text)
+            self.memory_fit_label.setProperty("fit", "yes" if fits else "no")
+            self.memory_fit_label.style().unpolish(self.memory_fit_label)
+            self.memory_fit_label.style().polish(self.memory_fit_label)
 
         prepared = printer.get("operatorPrepared") is True
         if not printer.get("status") or printer.get("status", {}).get("online") is False:
@@ -1324,6 +1380,10 @@ class PickerWindow(QMainWindow):
         self.file_path = file_path
         self.filename = filename
         self.machine_name = (machine_name or "").strip() or None
+        try:
+            self.file_size = os.path.getsize(file_path)
+        except OSError:
+            self.file_size = None  # memory_fit_label just stays hidden on every row rather than guessing
         self.rows = {}       # printer_id -> PrinterRowWidget
         self.sending = False
         self._loaded_once = False
@@ -1516,7 +1576,7 @@ class PickerWindow(QMainWindow):
                 # second, smaller contributor on top of this one). Giving
                 # every row a real parent up front, before filtering ever
                 # runs, fixes it regardless of which rows are visible.
-                row = PrinterRowWidget(p, parent=self.scroll_contents)
+                row = PrinterRowWidget(p, parent=self.scroll_contents, file_size=self.file_size)
                 row.on_selection_changed = self._update_selected_count
                 row.on_retry_requested = self._retry_single
                 self.rows[pid] = row
