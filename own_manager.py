@@ -2017,6 +2017,43 @@ def extract_field(buf, marker):
     return buf[start:end]
 
 
+def _wait_for_stable_file(path, max_polls, poll_interval=0.2):
+    """Polls up to `max_polls` times (poll_interval seconds apart) until
+    `path` exists and its size stops changing between two consecutive
+    checks - a cheap, portable way to wait out a still-in-progress write
+    without any OS-specific file-lock API. Returns as soon as it looks
+    stable; otherwise just runs out the full time budget. Callers still do
+    their own final existence check afterward - this only waits, it
+    doesn't decide anything.
+
+    Shared by handle_client()'s SaveFile-reply race fix (CHITUBOX's own
+    confirmation can arrive slightly before the write is actually flushed
+    to disk, especially for a large file - confirmed live 2026-08-31, 7
+    "SaveFile reply but file not found" occurrences across several days,
+    matching the "first click doesn't open the picker, second click works"
+    report) and slicer_file_watcher()'s backstop path, which already had
+    this exact wait inline (pre-existing, not new here) before this got
+    pulled out as a shared helper.
+
+    Known limitation, inherited unchanged from that original inline
+    version: "stable" only means two consecutive polls saw the same size,
+    so a writer that pauses mid-write for longer than poll_interval could
+    in principle be mistaken for finished. Not a new risk introduced here,
+    and not something CHITUBOX's own write pattern has ever shown live -
+    worth knowing about, not worth a bigger redesign for the bug this
+    fixes."""
+    last_size = -1
+    for _ in range(max_polls):
+        try:
+            size = os.path.getsize(path) if os.path.isfile(path) else -1
+        except OSError:
+            size = -1
+        if size == last_size and size > 0:
+            return
+        last_size = size
+        time.sleep(poll_interval)
+
+
 LOADWINDOW_REPLY = (
     "{\n"
     "    \"Handle\": \"network_send\",\n"
@@ -2055,6 +2092,21 @@ def handle_client(conn, addr):
                 logmsg("=== SaveFile reply: SavePath=%s (awaiting=%s) ===", save_path, awaiting_path)
                 candidate = save_path or awaiting_path
                 candidate = candidate.replace("/", os.sep)
+                # Real, recurring race confirmed live 2026-08-31 ("SaveFile
+                # reply but file not found", 7 occurrences across several
+                # days in the log - matches the "first click doesn't open
+                # the picker, second click works fine" report): CHITUBOX's
+                # own SaveFile JSON confirmation can arrive slightly before
+                # the actual write to disk is done/flushed, especially for
+                # a large slice file - a single immediate isfile() check
+                # can lose that race and give up entirely, with no retry.
+                # Wait for the file to actually appear, then (mirroring
+                # slicer_file_watcher()'s own size-stability wait) for its
+                # size to stop changing, before trusting it's really there
+                # and complete. Safe to block this thread for a few
+                # seconds - handle_client() runs on its own thread per
+                # connection now, this can't stall accepting new ones.
+                _wait_for_stable_file(candidate, max_polls=25)  # up to ~5s
                 if os.path.isfile(candidate):
                     try:
                         os.makedirs(RECEIVED_DIR, exist_ok=True)
@@ -2129,16 +2181,7 @@ def slicer_file_watcher():
                             continue
                         seen.add(path)
 
-                        last_size = -1
-                        for _ in range(30):  # up to ~6s
-                            try:
-                                size = os.path.getsize(path)
-                            except OSError:
-                                size = -1
-                            if size == last_size and size > 0:
-                                break
-                            last_size = size
-                            time.sleep(0.2)
+                        _wait_for_stable_file(path, max_polls=30)  # up to ~6s
 
                         try:
                             os.makedirs(RECEIVED_DIR, exist_ok=True)
