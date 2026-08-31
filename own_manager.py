@@ -675,8 +675,18 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
     polled status does once the upload actually starts moving."""
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
-        conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=15)
+        conn = None
         try:
+            # Constructing HTTPConnection itself doesn't touch the network
+            # (no socket opens until the first request), so this has never
+            # been observed failing in practice - but it's still a real
+            # code path, and moving it outside this try (as an earlier
+            # version did) meant any failure here would propagate straight
+            # out of poll_scalex_upload uncaught, crashing whatever thread
+            # is polling instead of reporting it via progress_cb like every
+            # other failure mode here does. Caught during test-writing
+            # 2026-08-31, not live - fixed defensively either way.
+            conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=15)
             conn.request("GET", path)
             resp = conn.getresponse()
             body = resp.read()
@@ -686,7 +696,8 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
                 progress_cb(True, True, None, "Не удалось получить статус: %s" % e, {})
             return
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
         try:
             status = json.loads(body.decode("utf-8", "replace"))
         except Exception:
