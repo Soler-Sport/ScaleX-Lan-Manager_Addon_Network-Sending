@@ -55,9 +55,16 @@ class TestExtractField:
         buf = '{"SavePath": "no closing quote here'
         assert own_manager.extract_field(buf, '"SavePath": "') is None
 
-    def test_extracts_first_occurrence(self):
+    def test_extracts_last_occurrence(self):
+        # 2026-09-08 (code-review fix, finding #8): a single recv() chunk
+        # can contain more than one CHITUBOX message concatenated together
+        # (REQUEST_COOLDOWN_SEC's own comment already acknowledges
+        # CHITUBOX sends "retry-burst pings") - extract_field must pick the
+        # LAST (most recent) occurrence, not the first/possibly-stale one,
+        # or a field like PrinterType/SliceFileName can silently come from
+        # an older message earlier in the same buffer.
         buf = '"SliceFileName": "first.ctb"} {"SliceFileName": "second.ctb"}'
-        assert own_manager.extract_field(buf, '"SliceFileName": "') == "first.ctb"
+        assert own_manager.extract_field(buf, '"SliceFileName": "') == "second.ctb"
 
     def test_empty_value(self):
         buf = '{"SavePath": ""}'

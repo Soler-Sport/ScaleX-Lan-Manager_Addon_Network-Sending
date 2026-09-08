@@ -150,6 +150,59 @@ def test_unprepared_printer_with_recommendations_defers_start(tmp_path):
     assert sent_start_body == {"path": "/local/test for Test.ctb", "queueIfNotPrepared": True}
 
 
+def test_goo_file_skips_ctb_patch_even_with_recommendations(tmp_path):
+    """2026-09-08 (code-review fix, finding #1): a printer with
+    recommendations configured plus applyRecommendations:true used to
+    unconditionally route through /api/ctb/patch-and-upload regardless of
+    the file's actual format - for an ELEGOO Jupiter 2 capture (.goo, v5
+    GOO bytes, not a CTB file at all) that meant posting non-CTB bytes to
+    an endpoint that parses/rewrites a CTB header server-side. The patch
+    must now be skipped for a non-.ctb file, falling back to the plain
+    upload endpoint instead - same as if recommendations weren't
+    requested at all."""
+    f = tmp_path / "test.goo"
+    f.write_bytes(b"V5.1fake goo data")
+
+    printer = {
+        "id": "p1", "displayName": "Jupiter 2", "operatorPrepared": True,
+        "status": {"remainingMemory": 999999999},
+        "recommendedNormalExposure": 2.8, "recommendedBottomExposure": 38.0,
+    }
+    responses = {
+        "/files": (202, {"uploadId": "up-1", "lastUploadedPath": "/local/test.goo"}),
+        "/api/uploads/up-1": (200, {"done": True, "success": True, "percent": 100.0}),
+    }
+    factory = _fake_connection_factory(responses)
+
+    done_event = threading.Event()
+    results = []
+
+    def report_cb(phase, percent, targets_out):
+        results.append((phase, percent, targets_out))
+        if phase in ("done", "error"):
+            done_event.set()
+
+    with patch("own_manager.fetch_printers", return_value=[printer]), \
+         patch("own_manager.http.client.HTTPConnection", side_effect=factory):
+        own_manager.send_in_background(
+            str(f), [{"printerId": "p1", "applyRecommendations": True}],
+            display_name="test.goo", start_print=True, report_cb=report_cb,
+        )
+        _wait_for_terminal(results, done_event)
+
+    final_phase, _, final_targets = results[-1]
+    assert final_phase == "done"
+    assert final_targets[0]["phase"] == "done"
+
+    # The CTB-patch endpoint must never be hit for a .goo file, even though
+    # recommendations were requested and are available - only the plain
+    # upload endpoint.
+    assert not any(c[1] == "/api/ctb/patch-and-upload" for c in factory.calls)
+    assert not any(c[1] == "/api/ctb/params" for c in factory.calls)
+    upload_call = next(c for c in factory.calls if c[1].endswith("/files"))
+    assert upload_call[3]["X-Start-Print"] == "true"
+
+
 def test_insufficient_memory_skips_without_any_http_call(tmp_path):
     """The memory pre-check must reject before any network call at all -
     confirmed live against a real 0-byte-free printer."""

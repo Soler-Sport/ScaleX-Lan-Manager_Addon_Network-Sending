@@ -302,8 +302,22 @@ def _extract_ctb_machine_name_fallback(file_path):
 
 
 def extract_ctb_machine_name(file_path):
-    """Best-effort: returns the CTB's embedded target-machine name (e.g.
+    """Best-effort: returns the file's embedded target-machine name (e.g.
     "ELEGOO Saturn 4 Ultra 16K"), or None if it can't be determined."""
+    # 2026-09-08: goo_hook.dll's own custom-built V5.1 output (only ever
+    # produced for ELEGOO Jupiter 2 - see goo_hook.c's resolution gate in
+    # convert_v3_to_v5) isn't a real CTB file at all, so neither
+    # CTB-specific extractor below can find anything in it (different
+    # magic, no embedded "Layout and record format..." anchor text) - the
+    # "Нарезано под" label was coming back blank for every Jupiter-2
+    # capture even though it's fully known. The magic byte alone already
+    # identifies it unambiguously.
+    try:
+        with open(file_path, "rb") as f:
+            if f.read(4) == b"V5.1":
+                return "ELEGOO Jupiter 2"
+    except OSError:
+        pass
     name = _extract_ctb_machine_name_precise(file_path)
     if name:
         return name
@@ -421,7 +435,7 @@ def force_window_to_foreground(qwidget):
 
 # --- Your own manager (ScaleX LAN Manager, FastAPI/uvicorn) ---
 SCALEX_HOST = "192.168.0.118"
-SCALEX_PORT = 8082
+SCALEX_PORT = 8081
 SCALEX_START_PRINT = False  # queue the transfer only, never auto-start a print
 
 os.makedirs(ROOT_DIR, exist_ok=True)
@@ -912,7 +926,24 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
                         tracker[pid]["percent"] = job_percent
                 _report()
 
-            patch = build_recommendation_patch(printer) if (t.get("applyRecommendations") and has_recommendations(printer)) else {}
+            # 2026-09-08 (code-review fix, finding #1): build_recommendation_patch
+            # only ever makes sense for a real CTB file - patch_and_upload_single
+            # posts to /api/ctb/patch-and-upload, which parses/rewrites a CTB
+            # header server-side. Since ELEGOO Jupiter 2 captures are now named
+            # ".goo" (v5 GOO bytes, see handle_client()'s SaveFile-request
+            # branch), a printer with recommendations configured plus
+            # applyRecommendations:true would previously send that .goo file
+            # through the CTB-patch endpoint regardless of its real format -
+            # either a hard failure or (worse) ScaleX misparsing/corrupting it
+            # at CTB-shaped offsets. Gate on the file's own extension instead of
+            # trusting the caller's intent alone.
+            wants_patch = t.get("applyRecommendations") and has_recommendations(printer)
+            is_ctb_patchable = file_path.lower().endswith(".ctb")
+            if wants_patch and not is_ctb_patchable:
+                logmsg("=== %s: applyRecommendations requested but %s isn't a .ctb file - "
+                       "skipping the CTB patch (not applicable to this format), sending as-is ===",
+                       pid, os.path.basename(file_path))
+            patch = build_recommendation_patch(printer) if (wants_patch and is_ctb_patchable) else {}
             try:
                 if patch:
                     status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, effective_start_print)
@@ -1488,11 +1519,18 @@ class PickerWindow(QMainWindow):
     _printers_signal = Signal(list, str)           # printers, error message ("" if ok)
     _retry_signal = Signal(list)                   # targets(list[dict]) - one row's own retry, not the whole-batch state
 
-    def __init__(self, file_path, filename, machine_name):
+    def __init__(self, file_path, filename, machine_name, chitubox_conn=None):
         super().__init__()
         self.file_path = file_path
         self.filename = filename
         self.machine_name = (machine_name or "").strip() or None
+        # 2026-09-08 (experimental): the live CHITUBOX TCP connection this
+        # capture came from, if any (a _ChituboxConn - thread-safe wrapper,
+        # see its own docstring - not a raw socket; None for
+        # slicer_file_watcher()'s backstop path, which has no connection at
+        # all) - kept only so closeEvent() can try to notify CHITUBOX this
+        # window closed. See LOADWINDOW_CLOSE_NOTIFY's comment for why.
+        self.chitubox_conn = chitubox_conn
         try:
             self.file_size = os.path.getsize(file_path)
         except OSError:
@@ -1885,6 +1923,32 @@ class PickerWindow(QMainWindow):
 
     def closeEvent(self, event):
         logmsg("=== picker window closed: %s ===", self.filename)
+        # 2026-09-08 (experimental, see LOADWINDOW_CLOSE_NOTIFY's comment):
+        # tell CHITUBOX this window is gone, unprompted.
+        #
+        # 2026-09-08 (code-review fix, finding #5): this used to call
+        # .send() directly, right here, on the Qt GUI thread. The
+        # connection's socket is a plain blocking socket with no timeout
+        # ever set anywhere in this file - if CHITUBOX has stopped
+        # servicing it without a clean close (crashed, frozen on a native
+        # modal, machine asleep), that send() could block for as long as
+        # the OS takes to notice the peer is gone (potentially minutes),
+        # freezing the ENTIRE app - every window, the tray icon, all of
+        # it - not just this one closing window. Firing it from a
+        # throwaway daemon thread instead keeps the GUI thread free no
+        # matter how long the send takes; _ChituboxConn.send() is already
+        # thread-safe (see its own docstring), so this is safe to do from
+        # here without any extra locking on this end.
+        if self.chitubox_conn is not None:
+            chandle = self.chitubox_conn
+            filename = self.filename
+
+            def _notify():
+                ok = chandle.send(LOADWINDOW_CLOSE_NOTIFY)
+                logmsg("=== %s LoadWindow(Visible:false) close notify for %s ===",
+                       "SENT" if ok else "SKIPPED (connection already gone)", filename)
+
+            threading.Thread(target=_notify, daemon=True).start()
         try:
             _open_windows.remove(self)
         except ValueError:
@@ -1915,15 +1979,20 @@ def _clean_display_filename(filename):
     return (cleaned or stem) + ext
 
 
-def open_picker_window(dest_path):
+def open_picker_window(dest_path, chitubox_conn=None):
     """Slot for AppController.file_captured - runs on the GUI thread (the
     signal/slot connection below is queued whenever the emitting thread
     differs from this one, e.g. handle_client()'s background thread), so
-    it's safe to create Qt widgets here."""
+    it's safe to create Qt widgets here. chitubox_conn (2026-09-08,
+    experimental) is the live CHITUBOX connection this capture came from,
+    as a _ChituboxConn (thread-safe wrapper, not a raw socket) - None from
+    slicer_file_watcher()'s backstop path, which has none - passed through
+    only so the window can notify CHITUBOX when it closes, see
+    PickerWindow.closeEvent."""
     filename = _clean_display_filename(os.path.basename(dest_path))
     machine_name = extract_ctb_machine_name(dest_path)
     logmsg("=== OPENING PICKER: %s (machine=%r) ===", filename, machine_name)
-    win = PickerWindow(dest_path, filename, machine_name)
+    win = PickerWindow(dest_path, filename, machine_name, chitubox_conn=chitubox_conn)
     win.show()
     force_window_to_foreground(win)
     _open_windows.append(win)
@@ -1933,8 +2002,12 @@ class AppController(QObject):
     """Lives on the GUI thread; background threads (CHITUBOX protocol
     handler, filesystem watcher) emit into file_captured instead of calling
     open_picker_window directly, so window creation always happens on the
-    right thread regardless of which thread captured the file."""
-    file_captured = Signal(str)
+    right thread regardless of which thread captured the file. The second
+    argument (2026-09-08, experimental) is the live CHITUBOX connection a
+    capture came from, as a _ChituboxConn (thread-safe wrapper - see its
+    own docstring), or None (slicer_file_watcher()'s backstop path has no
+    connection at all) - see PickerWindow.closeEvent."""
+    file_captured = Signal(str, object)
 
 
 controller = None  # created in main(), before any background thread starts
@@ -2007,7 +2080,16 @@ def build_tray_icon(app):
 # CHITUBOX tells us it's ready (LoadWindow) and just wait for the reply.
 # ---------------------------------------------------------------------------
 def extract_field(buf, marker):
-    idx = buf.find(marker)
+    # 2026-09-08 (code-review fix, finding #8): this protocol has no message
+    # framing beyond ad-hoc newline-joined JSON blobs, and a single
+    # conn.recv() chunk can contain more than one CHITUBOX message
+    # concatenated together (REQUEST_COOLDOWN_SEC's own comment already
+    # acknowledges CHITUBOX sends "retry-burst pings"). rfind (last match)
+    # instead of find (first match) picks the most RECENT occurrence in the
+    # chunk rather than the earliest/possibly-stale one - e.g. an older
+    # WindowProperty message concatenated before the current one would
+    # otherwise silently win for fields like PrinterType/SliceFileName.
+    idx = buf.rfind(marker)
     if idx < 0:
         return None
     start = idx + len(marker)
@@ -2063,17 +2145,236 @@ LOADWINDOW_REPLY = (
     "}\n"
 ).encode("utf-8")
 
+# 2026-09-08 (experimental): own_manager's own picker window is a totally
+# separate native Qt window, not anything CHITUBOX renders itself - as far
+# as CHITUBOX is concerned, every "LoadWindow" ping (sent on every
+# "Отправка по сети" click) just gets the same static Result:true reply
+# above, whether or not we actually showed anything, and we've never sent
+# CHITUBOX anything back when that window later closes. Confirmed live
+# 2026-09-08: after one successful capture cycle, further clicks stopped
+# producing a "Visible": true LoadWindow at all - CHITUBOX kept sending
+# "SlicerInfo" + "LoadWindow Visible:false" pings for over an hour instead,
+# exactly matching the "button does nothing, second click or Save Slice
+# works" report (Save Slice never touches this handshake at all, via
+# slicer_file_watcher()). Hypothesis: CHITUBOX's own side still believes
+# the network-send window is open from the last click (we told it
+# Result:true and never said otherwise), so it toggles instead of
+# reopening. Unverified against CHITUBOX's real protocol - sent
+# unprompted (not a reply to anything) when PickerWindow.closeEvent fires,
+# see there.
+LOADWINDOW_CLOSE_NOTIFY = (
+    "{\n"
+    "    \"Handle\": \"network_send\",\n"
+    "    \"MsgType\": \"LoadWindow\",\n"
+    "    \"Result\": true,\n"
+    "    \"Visible\": false,\n"
+    "    \"WinType\": 1\n"
+    "}\n"
+).encode("utf-8")
+
 REQUEST_COOLDOWN_SEC = 4.0  # collapse CHITUBOX's retry-burst pings into one request
+
+
+class _ChituboxConn:
+    """2026-09-08 (code-review fix, findings #4/#5): thread-safe wrapper
+    around one CHITUBOX TCP connection. Before this, handle_client()'s own
+    background thread called conn.send()/conn.close() directly, and
+    PickerWindow.closeEvent() (GUI thread) independently called
+    conn.send(LOADWINDOW_CLOSE_NOTIFY) on the very same socket with no
+    coordination between the two threads at all - a genuine race (two
+    concurrent sends could interleave on the wire; a send racing a close
+    hits platform-dependent behavior) papered over only by catching
+    OSError for the common "already closed" case, not the rarer true
+    concurrent-access case.
+
+    recv() is deliberately NOT lock-protected: handle_client() is the only
+    reader, ever, so there is no race to guard there, and serializing it
+    behind the same lock sends use would let a slow/blocked send stall the
+    read loop (or vice versa) for zero correctness benefit.
+
+    close() is idempotent, so a send arriving after close() (from either
+    thread) is just a normal, expected "connection already gone" - not a
+    race - and returns False instead of raising."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def send(self, data):
+        """Best-effort - True on success, False if already closed or the
+        send itself failed (caller decides whether/how loudly to log)."""
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._conn.send(data)
+                return True
+            except OSError:
+                return False
+
+    def recv(self, bufsize):
+        return self._conn.recv(bufsize)
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+
+
+_V5CONVERT_FLAG_PATH = r"C:\ChituHook\chitu_hook_v5convert.flag"
+
+_JUPITER2_PRINTER_TYPES = ("elegoo jupiter 2",)  # exact (normalized) values
+# seen live in CHITUBOX's own "PrinterType" field - see is_jupiter2 below
+
+
+def _goo_hook_convert_enabled():
+    """Mirrors goo_hook.c's own V5_IsConvertEnabled() exactly: same flag
+    file, same semantics (missing file, or content not starting with '0',
+    means enabled). 2026-09-08 (code-review fix, finding #3): lets
+    handle_client()/_finish_goo_v5_capture() skip the wait for a v5 sibling
+    entirely when the user has the "Convert to GOO v5" tray toggle off -
+    goo_hook.c's process_finished_goo() returns immediately, writing
+    nothing, in that case, so the old code always burned the full 60s
+    deadline for a sibling that could never appear."""
+    try:
+        with open(_V5CONVERT_FLAG_PATH, "rb") as f:
+            c = f.read(1)
+    except OSError:
+        return True  # missing file -> enabled, matching goo_hook.c exactly
+    return c != b"0"
+
+
+def _looks_like_native_v3_goo(path):
+    """True if `path` still starts with the v3 magic tag ("V3.0") - i.e.
+    goo_hook.dll either hasn't touched it yet or never will. 2026-09-08
+    (code-review fix, finding #2): goo_hook.c's process_finished_goo()
+    reopens this exact path with CREATE_ALWAYS (truncating it) right before
+    writing v5 bytes, and only renames it away once fully written - so
+    there's a real, if narrow (a single WriteFile call), window where the
+    file exists on disk but is truncated/mid-rewrite. Checking the magic
+    bytes before trusting a post-deadline fallback read is cheap insurance
+    against forwarding a corrupt partial file caught in that window."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"V3.0"
+    except OSError:
+        return False
+
+
+def _capture_and_emit(send_path, chandle):
+    """Shared by handle_client()'s two SaveFile-reply capture paths (plain
+    .ctb inline; Jupiter-2 .goo on its own thread, see
+    _finish_goo_v5_capture below) - 2026-09-08 (code-review cleanup, pulled
+    out of what used to be duplicated inline in both places). Copies
+    send_path into RECEIVED_DIR, removes the PENDING staging copy, and
+    emits file_captured so the picker opens on the GUI thread. chandle is
+    the _ChituboxConn this capture came from (None from
+    slicer_file_watcher()'s backstop path, which has no connection)."""
+    try:
+        os.makedirs(RECEIVED_DIR, exist_ok=True)
+        dest = os.path.join(RECEIVED_DIR, os.path.basename(send_path))
+        shutil.copy2(send_path, dest)
+        logmsg("=== CTB CAPTURED via direct request: %s -> %s (%d bytes) ===",
+               send_path, dest, os.path.getsize(dest))
+        # send_path (in PENDING_DIR) was only ever a staging copy for
+        # CHITUBOX/goo_hook to write into - dest (in RECEIVED_DIR) is the
+        # real, permanent one. Nothing ever reads it again once this copy
+        # has succeeded, so leaving it in place just double-counts every
+        # capture's disk footprint for no reason.
+        try:
+            os.remove(send_path)
+        except OSError as e:
+            logmsg("=== failed to remove PENDING copy %s after capture: %s ===", send_path, e)
+        controller.file_captured.emit(dest, chandle)
+    except Exception as e:
+        logmsg("=== capture after SaveFile reply FAILED: %s (%s) ===", send_path, e)
+
+
+def _finish_goo_v5_capture(candidate, chandle):
+    """Runs on its own daemon thread - spawned from handle_client() only for
+    the ELEGOO Jupiter 2 .goo case. 2026-09-08 (code-review fix, finding
+    #10): the up-to-60s wait for goo_hook.dll's v5-converted sibling used to
+    run inline in handle_client()'s own per-connection thread, blocking
+    that connection's conn.recv() loop for up to a minute per Jupiter-2
+    capture - CHITUBOX keeps one persistent connection for its whole
+    runtime, so any further message it sent on that same socket during the
+    wait (a second click, a PrinterType/SliceFileName update) just sat
+    unread until the wait finished. Moving the wait here lets
+    handle_client() go straight back to conn.recv() instead.
+
+    Deliberately has no bare/undecorated body: back when this ran inline in
+    handle_client(), an unexpected exception here would propagate up
+    through handle_client()'s own try/finally and get logged by
+    _chitubox_accept_loop()'s wrapper ("handle_client FAILED ..."). Running
+    on its own bare thread instead means an uncaught exception here would
+    otherwise just die silently via Python's default thread excepthook -
+    invisible in own_manager.log, the only place this app's failures are
+    ever actually looked for. See the try/except wrapping the whole body
+    below (2026-09-08, second-pass code-review fix)."""
+    try:
+        _finish_goo_v5_capture_body(candidate, chandle)
+    except Exception as e:
+        logmsg("=== _finish_goo_v5_capture FAILED for %s: %s ===", candidate, e)
+
+
+def _finish_goo_v5_capture_body(candidate, chandle):
+    v5_candidate = os.path.join(os.path.dirname(candidate), "v5_" + os.path.basename(candidate))
+
+    if not _goo_hook_convert_enabled():
+        logmsg("=== goo_hook v3->v5 conversion is disabled (tray toggle) - "
+               "skipping the wait for a v5 sibling of %s ===", candidate)
+    else:
+        # Real jobs have taken up to ~25s parallelized per goo_hook's own
+        # timing logs - give it real margin.
+        v5_deadline = time.monotonic() + 60.0
+        while time.monotonic() < v5_deadline and not os.path.isfile(v5_candidate):
+            time.sleep(0.5)
+
+    if os.path.isfile(v5_candidate):
+        _wait_for_stable_file(v5_candidate, max_polls=10)  # already fully written by the rename; just a safety margin
+        logmsg("=== goo_hook v5-converted sibling found: %s ===", v5_candidate)
+        _capture_and_emit(v5_candidate, chandle)
+        return
+
+    # No v5 sibling - fall back to the original file, but (finding #2) only
+    # if it still genuinely looks like the untouched native v3 file
+    # goo_hook hasn't started rewriting (or never will), not just
+    # "something happens to exist at that path right now".
+    if os.path.isfile(candidate) and _looks_like_native_v3_goo(candidate):
+        logmsg("=== WARNING: no v5_-prefixed sibling appeared for %s - "
+               "sending CHITUBOX's native v3 file as-is (goo_hook.dll not installed/"
+               "running, disabled, or conversion failed) ===", candidate)
+        _capture_and_emit(candidate, chandle)
+    else:
+        logmsg("=== SaveFile reply: no usable file left at %s after waiting for goo_hook "
+               "(missing, or caught mid-rewrite) ===", candidate)
 
 
 def handle_client(conn, addr):
     logmsg("=== CLIENT CONNECTED from %s:%d ===", addr[0], addr[1])
+    chandle = _ChituboxConn(conn)  # 2026-09-08 (code-review fix, findings #4/#5) - see its own docstring
     last_request_ts = 0.0
     awaiting_path = None
     slice_label = "network_send"
+    printer_type = ""  # 2026-09-08: from CHITUBOX's own "PrinterType" JSON
+    # field (same WindowProperty payload as SliceFileName) - gates whether
+    # we request ".goo" (only correct for ELEGOO Jupiter 2, whose v3 output
+    # goo_hook.dll knows how to convert to real v5) vs the original ".ctb"
+    # for every other printer (e.g. Saturn 4 Ultra 16K, which is used as
+    # .ctb only - CHITUBOX's raw v3 bytes under a ".goo" name for a printer
+    # goo_hook.dll doesn't know about would be silently wrong). Persists for
+    # the whole connection (CHITUBOX doesn't necessarily resend it on every
+    # single ping) - see the empty-value warning below for the one edge
+    # case that doesn't cover (code-review finding #6).
     try:
         while True:
-            chunk = conn.recv(65536)
+            chunk = chandle.recv(65536)
             if not chunk:
                 break
             try:
@@ -2085,6 +2386,10 @@ def handle_client(conn, addr):
             label = extract_field(text, '"SliceFileName": "')
             if label:
                 slice_label = os.path.splitext(label)[0]
+
+            pt = extract_field(text, '"PrinterType": "')
+            if pt:
+                printer_type = pt
 
             # The reply to our own SaveFile request: {"MsgType":"SaveFile","Data":{"SavePath":...}}
             if '"MsgType": "SaveFile"' in text and awaiting_path:
@@ -2107,52 +2412,94 @@ def handle_client(conn, addr):
                 # seconds - handle_client() runs on its own thread per
                 # connection now, this can't stall accepting new ones.
                 _wait_for_stable_file(candidate, max_polls=25)  # up to ~5s
-                if os.path.isfile(candidate):
-                    try:
-                        os.makedirs(RECEIVED_DIR, exist_ok=True)
-                        dest = os.path.join(RECEIVED_DIR, os.path.basename(candidate))
-                        shutil.copy2(candidate, dest)
-                        logmsg("=== CTB CAPTURED via direct request: %s -> %s (%d bytes) ===",
-                               candidate, dest, os.path.getsize(dest))
-                        # candidate (in PENDING_DIR) was only ever a staging
-                        # copy for CHITUBOX to write into - dest (in
-                        # RECEIVED_DIR) is the real, permanent one. Nothing
-                        # ever reads it again once this copy has succeeded,
-                        # so leaving it in place just double-counts every
-                        # capture's disk footprint for no reason - remove
-                        # it right away instead of letting it sit there
-                        # forever like RECEIVED_DIR used to.
-                        try:
-                            os.remove(candidate)
-                        except OSError as e:
-                            logmsg("=== failed to remove PENDING copy %s after capture: %s ===", candidate, e)
-                        controller.file_captured.emit(dest)
-                    except Exception as e:
-                        logmsg("=== capture after SaveFile reply FAILED: %s (%s) ===", candidate, e)
+
+                # 2026-09-08: only ELEGOO Jupiter 2 requests are ever named
+                # ".goo" (see the request-building code below) - that's the
+                # only case goo_hook.dll's DirWatcher will pick up and
+                # convert v3->v5, renaming the result to "v5_<original
+                # name>" in the SAME directory once done (see
+                # rename_with_v5_prefix() in goo_hook.c), which renames
+                # `candidate` itself away out from under us. For every
+                # other printer (.ctb request), nothing will ever touch
+                # this file - skip straight to capturing it as-is.
+                #
+                # 2026-09-08 (code-review fix, finding #10): the .goo wait
+                # itself now runs on its own thread (_finish_goo_v5_capture)
+                # instead of blocking this connection's own recv() loop for
+                # up to 60s - see that function's docstring.
+                if candidate.lower().endswith(".goo"):
+                    threading.Thread(target=_finish_goo_v5_capture, args=(candidate, chandle), daemon=True).start()
+                elif os.path.isfile(candidate):
+                    _capture_and_emit(candidate, chandle)
                 else:
                     logmsg("=== SaveFile reply but file not found at %s ===", candidate)
                 awaiting_path = None
 
             if '"MsgType": "LoadWindow"' in text and '"WinType"' in text:
-                sent = conn.send(LOADWINDOW_REPLY)
-                logmsg("SENT (%d bytes) LoadWindow reply", sent)
+                ok = chandle.send(LOADWINDOW_REPLY)
+                logmsg("%s (%d bytes) LoadWindow reply", "SENT" if ok else "SEND FAILED", len(LOADWINDOW_REPLY))
 
                 if '"Visible": true' in text:
                     now = time.monotonic()
                     if now - last_request_ts >= REQUEST_COOLDOWN_SEC:
                         last_request_ts = now
                         os.makedirs(PENDING_DIR, exist_ok=True)
-                        target = os.path.join(PENDING_DIR, "%s_%s.ctb" % (slice_label, uuid.uuid4().hex[:8]))
+                        # 2026-09-08: request ".goo" ONLY for ELEGOO Jupiter
+                        # 2 - goo_hook.dll's own DirWatcher (which
+                        # recursively watches every drive for *.goo
+                        # activity, not just the normal Save Slice folder)
+                        # picks a *.goo file up and converts it v3->v5 in
+                        # place, but that v5 header/table layout is only
+                        # valid for Jupiter 2's real panel - CHITUBOX just
+                        # writes whatever native (v3) bytes it has to
+                        # whatever path we hand it regardless of extension,
+                        # so naming any OTHER printer's output ".goo" would
+                        # make goo_hook.dll wrongly "convert" it too. Every
+                        # other printer (e.g. Saturn 4 Ultra 16K, used as
+                        # .ctb only) keeps the original ".ctb" behavior,
+                        # completely unchanged. See the SaveFile-reply
+                        # handling below for how we wait for goo_hook's
+                        # conversion (and its "v5_" rename) to finish
+                        # before treating a Jupiter-2 file as ready to send.
+                        #
+                        # 2026-09-08 (code-review fix, finding #7): exact
+                        # match against known values, not a substring check -
+                        # printer_matches_machine() (see above) deliberately
+                        # avoids substring matching for the identical reason
+                        # ("Saturn 4 Ultra" vs "Saturn 4 Ultra 16K" - a
+                        # substring check matches both). A hypothetical
+                        # future "Jupiter 2 Pro"/"Jupiter 2 Max" PrinterType
+                        # would otherwise silently get routed through a
+                        # conversion pipeline that's only valid for the real
+                        # Jupiter 2 panel.
+                        printer_type_norm = printer_type.strip().lower()
+                        is_jupiter2 = printer_type_norm in _JUPITER2_PRINTER_TYPES
+                        if not printer_type_norm:
+                            # 2026-09-08 (code-review fix, finding #6): no
+                            # PrinterType has been seen on this connection
+                            # yet (e.g. this is the very first click before
+                            # any WindowProperty/SlicerInfo message
+                            # arrived). Defaulting to .ctb is the SAFER of
+                            # the two possible wrong guesses (a wrong .goo
+                            # would make goo_hook.dll "convert" a different
+                            # printer's output), but it's still a guess -
+                            # log it loudly so a future "doesn't work for
+                            # Jupiter 2 on the very first click" report is
+                            # diagnosable from the log instead of a mystery.
+                            logmsg("  -> WARNING: no PrinterType seen yet on this connection - "
+                                   "defaulting to .ctb (would be wrong for ELEGOO Jupiter 2)")
+                        ext = ".goo" if is_jupiter2 else ".ctb"
+                        target = os.path.join(PENDING_DIR, "%s_%s%s" % (slice_label, uuid.uuid4().hex[:8], ext))
                         awaiting_path = target
                         request = json.dumps({"MsgType": "SaveFile", "FilePath": target.replace("\\", "/")})
-                        conn.send((request + "\n").encode("utf-8"))
+                        chandle.send((request + "\n").encode("utf-8"))
                         logmsg("=== REQUESTED SaveFile: %s ===", target)
                     else:
                         logmsg("  -> Visible:true within cooldown (%.1fs ago), not requesting again",
                                now - last_request_ts)
     finally:
         logmsg("=== CLIENT DISCONNECTED ===")
-        conn.close()
+        chandle.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2193,7 +2540,7 @@ def slicer_file_watcher():
                             logmsg("=== SLICER FILE CAPTURE FAILED: %s (%s) ===", path, e)
                             continue
 
-                        controller.file_captured.emit(dest)
+                        controller.file_captured.emit(dest, None)
         except Exception as e:
             logmsg("=== slicer_file_watcher error: %s ===", e)
         time.sleep(POLL_INTERVAL_SEC)
