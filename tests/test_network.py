@@ -1,4 +1,4 @@
-"""Tests for own_manager's ScaleX HTTP call sites - forward_to_scalex,
+"""Tests for slm_chitu_send's ScaleX HTTP call sites - forward_to_scalex,
 patch_and_upload_single, start_stored_file, and poll_scalex_upload's
 terminal-state detection. http.client.HTTPConnection is mocked throughout
 so these never touch a real network - real end-to-end behavior against
@@ -8,7 +8,7 @@ handling so a regression is caught without needing the real farm."""
 import json
 from unittest.mock import MagicMock, patch
 
-import own_manager
+import slm_chitu_send
 
 
 def _mock_conn(status=200, body=b'{"ok": true}'):
@@ -27,8 +27,8 @@ class TestForwardToScalex:
         f = tmp_path / "test.ctb"
         f.write_bytes(b"fake ctb bytes")
         conn = _mock_conn(status=202, body=b'{"uploadId": "abc123"}')
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            status, body = own_manager.forward_to_scalex(str(f), "printer-1", display_name="test.ctb", start_print=True)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            status, body = slm_chitu_send.forward_to_scalex(str(f), "printer-1", display_name="test.ctb", start_print=True)
 
         assert status == 202
         assert json.loads(body)["uploadId"] == "abc123"
@@ -41,8 +41,8 @@ class TestForwardToScalex:
         f = tmp_path / "test.ctb"
         f.write_bytes(b"x")
         conn = _mock_conn()
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.forward_to_scalex(str(f), "p1", start_print=True)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.forward_to_scalex(str(f), "p1", start_print=True)
         headers = conn.request.call_args[1]["headers"]
         assert headers["X-Start-Print"] == "true"
 
@@ -50,8 +50,8 @@ class TestForwardToScalex:
         f = tmp_path / "test.ctb"
         f.write_bytes(b"x")
         conn = _mock_conn()
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.forward_to_scalex(str(f), "p1", start_print=False)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.forward_to_scalex(str(f), "p1", start_print=False)
         headers = conn.request.call_args[1]["headers"]
         assert headers["X-Start-Print"] == "false"
 
@@ -59,8 +59,8 @@ class TestForwardToScalex:
         f = tmp_path / "internal_name_abc123.ctb"
         f.write_bytes(b"x")
         conn = _mock_conn()
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.forward_to_scalex(str(f), "p1", display_name="Pretty Name.ctb")
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.forward_to_scalex(str(f), "p1", display_name="Pretty Name.ctb")
         headers = conn.request.call_args[1]["headers"]
         assert "Pretty" in headers["X-File-Name"] or "Pretty%20Name" in headers["X-File-Name"]
 
@@ -68,8 +68,8 @@ class TestForwardToScalex:
 class TestPatchAndUploadSingle:
     def test_sends_correct_json_body(self):
         conn = _mock_conn(status=202, body=b'{"ok": true}')
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            status, body = own_manager.patch_and_upload_single(
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            status, body = slm_chitu_send.patch_and_upload_single(
                 "draft-1", "printer-1", {"normalExposure": 2.8}, True)
 
         assert status == 202
@@ -81,8 +81,8 @@ class TestPatchAndUploadSingle:
 
     def test_auto_start_coerced_to_bool(self):
         conn = _mock_conn()
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.patch_and_upload_single("d1", "p1", {}, "truthy-string")
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.patch_and_upload_single("d1", "p1", {}, "truthy-string")
         sent = json.loads(conn.request.call_args[1]["body"])
         assert sent["autoStart"] is True
 
@@ -90,8 +90,8 @@ class TestPatchAndUploadSingle:
 class TestStartStoredFile:
     def test_posts_path_and_queue_flag(self):
         conn = _mock_conn(status=200, body=b'{"ok": true, "queued": true, "state": "waiting_preparation"}')
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            status, body = own_manager.start_stored_file("printer-1", "/local/file.ctb", True)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            status, body = slm_chitu_send.start_stored_file("printer-1", "/local/file.ctb", True)
 
         assert status == 200
         assert json.loads(body)["state"] == "waiting_preparation"
@@ -102,15 +102,15 @@ class TestStartStoredFile:
 
     def test_queue_if_not_prepared_false(self):
         conn = _mock_conn()
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.start_stored_file("p1", "/local/f.ctb", False)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.start_stored_file("p1", "/local/f.ctb", False)
         sent = json.loads(conn.request.call_args[1]["body"])
         assert sent["queueIfNotPrepared"] is False
 
     def test_printer_id_url_encoded(self):
         conn = _mock_conn()
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.start_stored_file("printer with spaces", "/local/f.ctb", True)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.start_stored_file("printer with spaces", "/local/f.ctb", True)
         path = conn.request.call_args[0][1]
         assert " " not in path
 
@@ -130,9 +130,9 @@ class TestPollScalexUpload:
         def progress_cb(is_terminal, is_error, job_percent, message, status):
             calls.append((is_terminal, is_error, job_percent, message, status))
 
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn), \
-             patch("own_manager.time.sleep"):
-            own_manager.poll_scalex_upload("/api/uploads/x", "test.ctb", progress_cb=progress_cb)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn), \
+             patch("slm_chitu_send.time.sleep"):
+            slm_chitu_send.poll_scalex_upload("/api/uploads/x", "test.ctb", progress_cb=progress_cb)
         return calls
 
     def test_single_terminal_success_tick(self):
@@ -174,10 +174,10 @@ class TestPollScalexUpload:
         assert raw_status.get("lastUploadedPath") == "/local/preptest for Test.ctb"
 
     def test_connection_failure_reports_terminal_error(self):
-        with patch("own_manager.http.client.HTTPConnection", side_effect=OSError("network down")), \
-             patch("own_manager.time.sleep"):
+        with patch("slm_chitu_send.http.client.HTTPConnection", side_effect=OSError("network down")), \
+             patch("slm_chitu_send.time.sleep"):
             calls = []
-            own_manager.poll_scalex_upload("/api/uploads/x", "test.ctb",
+            slm_chitu_send.poll_scalex_upload("/api/uploads/x", "test.ctb",
                                             progress_cb=lambda *a: calls.append(a))
         assert len(calls) == 1
         assert calls[0][0] is True
@@ -188,10 +188,10 @@ class TestPollScalexUpload:
         resp = MagicMock()
         resp.read.return_value = b"not json at all"
         conn.getresponse.return_value = resp
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn), \
-             patch("own_manager.time.sleep"):
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn), \
+             patch("slm_chitu_send.time.sleep"):
             calls = []
-            own_manager.poll_scalex_upload("/api/uploads/x", "test.ctb",
+            slm_chitu_send.poll_scalex_upload("/api/uploads/x", "test.ctb",
                                             progress_cb=lambda *a: calls.append(a))
         assert len(calls) == 1
         assert calls[0][0] is True  # terminal
@@ -199,5 +199,5 @@ class TestPollScalexUpload:
 
     def test_no_progress_cb_does_not_raise(self):
         conn = _mock_conn(status=200, body=json.dumps({"done": True, "percent": 100.0}).encode())
-        with patch("own_manager.http.client.HTTPConnection", return_value=conn):
-            own_manager.poll_scalex_upload("/api/uploads/x", "test.ctb", progress_cb=None)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.poll_scalex_upload("/api/uploads/x", "test.ctb", progress_cb=None)

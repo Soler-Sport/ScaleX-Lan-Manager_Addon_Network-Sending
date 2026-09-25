@@ -11,7 +11,7 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
-import own_manager
+import slm_chitu_send
 
 
 def _fake_connection_factory(responses_by_path_suffix):
@@ -75,9 +75,9 @@ def test_prepared_printer_starts_immediately_no_recommendations(tmp_path):
         if phase in ("done", "error"):
             done_event.set()
 
-    with patch("own_manager.fetch_printers", return_value=[printer]), \
-         patch("own_manager.http.client.HTTPConnection", side_effect=factory):
-        own_manager.send_in_background(
+    with patch("slm_chitu_send.fetch_printers", return_value=[printer]), \
+         patch("slm_chitu_send.http.client.HTTPConnection", side_effect=factory):
+        slm_chitu_send.send_in_background(
             str(f), [{"printerId": "p1", "applyRecommendations": False}],
             display_name="test.ctb", start_print=True, report_cb=report_cb,
         )
@@ -125,9 +125,9 @@ def test_unprepared_printer_with_recommendations_defers_start(tmp_path):
         if phase in ("done", "error"):
             done_event.set()
 
-    with patch("own_manager.fetch_printers", return_value=[printer]), \
-         patch("own_manager.http.client.HTTPConnection", side_effect=factory):
-        own_manager.send_in_background(
+    with patch("slm_chitu_send.fetch_printers", return_value=[printer]), \
+         patch("slm_chitu_send.http.client.HTTPConnection", side_effect=factory):
+        slm_chitu_send.send_in_background(
             str(f), [{"printerId": "p1", "applyRecommendations": True}],
             display_name="test.ctb", start_print=True, report_cb=report_cb,
         )
@@ -182,9 +182,9 @@ def test_goo_file_skips_ctb_patch_even_with_recommendations(tmp_path):
         if phase in ("done", "error"):
             done_event.set()
 
-    with patch("own_manager.fetch_printers", return_value=[printer]), \
-         patch("own_manager.http.client.HTTPConnection", side_effect=factory):
-        own_manager.send_in_background(
+    with patch("slm_chitu_send.fetch_printers", return_value=[printer]), \
+         patch("slm_chitu_send.http.client.HTTPConnection", side_effect=factory):
+        slm_chitu_send.send_in_background(
             str(f), [{"printerId": "p1", "applyRecommendations": True}],
             display_name="test.goo", start_print=True, report_cb=report_cb,
         )
@@ -221,9 +221,9 @@ def test_insufficient_memory_skips_without_any_http_call(tmp_path):
         if phase in ("done", "error"):
             done_event.set()
 
-    with patch("own_manager.fetch_printers", return_value=[printer]), \
-         patch("own_manager.http.client.HTTPConnection", side_effect=factory):
-        own_manager.send_in_background(
+    with patch("slm_chitu_send.fetch_printers", return_value=[printer]), \
+         patch("slm_chitu_send.http.client.HTTPConnection", side_effect=factory):
+        slm_chitu_send.send_in_background(
             str(f), [{"printerId": "p1", "applyRecommendations": False}],
             display_name="test.ctb", start_print=False, report_cb=report_cb,
         )
@@ -262,9 +262,9 @@ def test_multiple_targets_dispatched_independently(tmp_path):
         if phase in ("done", "error"):
             done_event.set()
 
-    with patch("own_manager.fetch_printers", return_value=printers), \
-         patch("own_manager.http.client.HTTPConnection", side_effect=factory):
-        own_manager.send_in_background(
+    with patch("slm_chitu_send.fetch_printers", return_value=printers), \
+         patch("slm_chitu_send.http.client.HTTPConnection", side_effect=factory):
+        slm_chitu_send.send_in_background(
             str(f), [{"printerId": "ok", "applyRecommendations": False},
                      {"printerId": "full", "applyRecommendations": False}],
             display_name="test.ctb", start_print=False, report_cb=report_cb,

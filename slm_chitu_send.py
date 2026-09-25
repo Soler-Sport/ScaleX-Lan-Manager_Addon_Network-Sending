@@ -1,15 +1,15 @@
 """
-own_manager.py - forwards every file CHITUBOX sends over "Network Sending"
+slm_chitu_send.py - forwards every file CHITUBOX sends over "Network Sending"
 to one or more printers on your own ScaleX LAN Manager farm. A native Qt
 (PySide6) window pops up for each captured file, letting you rename it,
 pick printers (checkboxes), and apply each printer's own recommended
 exposure settings - with a tray icon so it's clear it's running and easy to
 exit from there.
 
-Run: python own_manager.py
+Run: python slm_chitu_send.py
 Requires: PySide6 (pip install PySide6), pycryptodome (optional, see
 extract_ctb_machine_name).
-Log: C:\\own_manager\\own_manager.log
+Log: C:\\slm_chitu_send\\slm_chitu_send.log
 
 ============================================================================
 SESSION NOTES
@@ -25,19 +25,19 @@ still required clicking through ChituManager's own login/printer-select/
 Send UI every time.
 
 This file uses the one that actually works end to end with zero
-ChituManager involvement: own_manager hijacks the same QSharedMemory
+ChituManager involvement: slm_chitu_send hijacks the same QSharedMemory
 segment CHITUBOX uses to discover "the manager" (create_shared_memory),
-so CHITUBOX connects straight to own_manager's own TCP listener instead of
+so CHITUBOX connects straight to slm_chitu_send's own TCP listener instead of
 launching ChituManager at all. CHITUBOX itself (not ChituManager) natively
 understands a {"MsgType":"SaveFile","FilePath":"<path>"} request and will
 either copy its already-sliced internal file or run a real slice job and
 then write exactly that path (confirmed via Ghidra decompile of CHITUBOX
 Pro.exe's own ChituManager::saveSliceFile / ChituManager::saveSlicerFileOver,
-2026-08-19) - own_manager asks for this the moment CHITUBOX says it's ready
+2026-08-19) - slm_chitu_send asks for this the moment CHITUBOX says it's ready
 (its "LoadWindow" ping) and, once the file lands, opens the picker page.
 
 The picker UI has gone through three approaches now, in order: (1) tkinter
-(a plain native popup); (2) a page served by own_manager's own local HTTP
+(a plain native popup); (2) a page served by slm_chitu_send's own local HTTP
 server, reusing ScaleX's real stylesheet live over the network
 (http://<scalex host>/styles.css) so it looked like a genuine part of the
 same app - worked well visually, but needed an embedded browser (pywebview,
@@ -122,9 +122,9 @@ try:
 except ImportError:
     AES = None
 
-ROOT_DIR = r"C:\own_manager"
+ROOT_DIR = r"C:\slm_chitu_send\data"
 RECEIVED_DIR = os.path.join(ROOT_DIR, "received")  # local backup copy - see RECEIVED_RETENTION_DAYS below
-LOG_PATH = os.path.join(ROOT_DIR, "own_manager.log")
+LOG_PATH = os.path.join(ROOT_DIR, "slm_chitu_send.log")
 
 # CTB files routinely run 300MB-900MB each, and every one gets a permanent
 # local copy in RECEIVED_DIR - on a farm doing several real sends a day
@@ -558,7 +558,7 @@ def force_window_to_foreground(qwidget):
     button instead of switching - modern Windows (10/11) separately checks
     whether the calling process looks like it just received real user
     input before honoring SetForegroundWindow from a background process at
-    all, and own_manager (reacting to a background thread's signal) never
+    all, and slm_chitu_send (reacting to a background thread's signal) never
     does. The standard, widely-documented workaround for that second check:
     synthesize a harmless Alt keydown/keyup via keybd_event right before
     asking - this only feeds this process's own synthetic input queue, it
@@ -1066,7 +1066,7 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
         #
         # Targets are dispatched to ScaleX *concurrently*, not one at a time
         # - ScaleX's own manager already queues/throttles transfers to each
-        # printer itself, own_manager doesn't need to serialize on top of
+        # printer itself, slm_chitu_send doesn't need to serialize on top of
         # that (that just makes a multi-printer send take N times longer
         # than it needs to for no reason).
         if report_cb:
@@ -1259,7 +1259,7 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
                         # pre-check above (confirmed live 2026-08-25: a
                         # printer can pass the memory check and still get
                         # 409'd seconds later because something else is
-                        # concurrently using it that own_manager's own
+                        # concurrently using it that slm_chitu_send's own
                         # periodic snapshot never saw). Worth its own
                         # message instead of a generic "Ошибка" so a retry
                         # actually tells you something useful.
@@ -1419,7 +1419,7 @@ def printer_memory_fit(printer, file_size):
 def printer_is_uploading(p):
     """True while ScaleX still has an active (non-final) upload job
     targeting this printer - i.e. it's already receiving a file right now,
-    from someone else's send or a previous own_manager batch. printStatus
+    from someone else's send or a previous slm_chitu_send batch. printStatus
     alone can still read "idle" for the whole transfer (the printer only
     starts actually printing once the file has fully landed and, if
     autoStart was set, ScaleX tells it to) - printer_is_busy() alone would
@@ -1772,7 +1772,7 @@ class PrinterRowWidget(QFrame):
             # queueIfNotPrepared mechanism instead of starting blind or
             # not starting at all (per user request 2026-08-27). ScaleX
             # itself starts the print once an operator marks the printer
-            # prepared - nothing more for own_manager to do here.
+            # prepared - nothing more for slm_chitu_send to do here.
             self.mini_progress.setRange(0, 100)
             self.mini_progress.setValue(100)
             self.mini_progress_label.setText("Загружено — старт назначен, ждём подтверждения подготовки")
@@ -1789,7 +1789,7 @@ class PickerWindow(QMainWindow):
     """One per captured file - the desktop replacement for the old
     PAGE_HTML page. file_path/filename/machine_name are known up front
     (no PENDING/id indirection needed any more - this window IS the state,
-    there's no HTTP boundary between it and own_manager's own backend
+    there's no HTTP boundary between it and slm_chitu_send's own backend
     functions any more)."""
 
     _progress_signal = Signal(str, object, list)   # phase, percent(float|None), targets(list[dict])
@@ -2384,10 +2384,10 @@ controller = None  # created in main(), before any background thread starts
 
 
 # "1a / Send over grid" from the project's icon design pass (2026-08-21) -
-# a multi-resolution .ico (16/24/32/48/256, see own_manager_icon.ico) so
+# a multi-resolution .ico (16/24/32/48/256, see slm_chitu_send_icon.ico) so
 # Windows can pick a crisp size for the tray, Alt-Tab, and taskbar instead
 # of scaling one flat bitmap.
-ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "own_manager_icon.ico")
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slm_chitu_send_icon.ico")
 
 
 def _make_tray_icon():
@@ -2422,7 +2422,7 @@ def _manual_send_dialog():
 
 def build_tray_icon(app):
     tray = QSystemTrayIcon(_make_tray_icon())
-    tray.setToolTip("own_manager - CHITUBOX -> ScaleX bridge")
+    tray.setToolTip("slm_chitu_send - CHITUBOX -> ScaleX bridge")
     menu = QMenu()
     act_manual = QAction("Отправить файл вручную…")
     act_manual.triggered.connect(_manual_send_dialog)
@@ -2515,7 +2515,7 @@ LOADWINDOW_REPLY = (
     "}\n"
 ).encode("utf-8")
 
-# 2026-09-08 (experimental): own_manager's own picker window is a totally
+# 2026-09-08 (experimental): slm_chitu_send's own picker window is a totally
 # separate native Qt window, not anything CHITUBOX renders itself - as far
 # as CHITUBOX is concerned, every "LoadWindow" ping (sent on every
 # "Отправка по сети" click) just gets the same static Result:true reply
@@ -2548,7 +2548,7 @@ REQUEST_COOLDOWN_SEC = 4.0  # collapse CHITUBOX's retry-burst pings into one req
 # minutes regardless of activity (confirmed live - "handle_client FAILED
 # ...: [WinError 10054] ... принудительно разорвал существующее
 # подключение", twice, ~5.5 min apart, during an otherwise-idle stretch).
-# own_manager's accept loop handles that fine (new connection, clean
+# slm_chitu_send's accept loop handles that fine (new connection, clean
 # state) - but a genuinely long slice (a big multi-part plate) that
 # outlives that window orphans whatever SaveFile request was in flight:
 # handle_client()'s thread dies with the dead connection before CHITUBOX
@@ -2560,7 +2560,7 @@ REQUEST_COOLDOWN_SEC = 4.0  # collapse CHITUBOX's retry-burst pings into one req
 # слайс").
 PENDING_ORPHAN_GRACE_SEC = 120  # deliberately generous - real jobs finish
 # their live round-trip in seconds to low tens of seconds per
-# own_manager.log's own timings; this only needs to be comfortably shorter
+# slm_chitu_send.log's own timings; this only needs to be comfortably shorter
 # than the ~5-6 min reset window and comfortably longer than normal
 # variance, not tightly tuned.
 
@@ -2723,7 +2723,7 @@ def _finish_goo_v5_capture(candidate, chandle):
     _chitubox_accept_loop()'s wrapper ("handle_client FAILED ..."). Running
     on its own bare thread instead means an uncaught exception here would
     otherwise just die silently via Python's default thread excepthook -
-    invisible in own_manager.log, the only place this app's failures are
+    invisible in slm_chitu_send.log, the only place this app's failures are
     ever actually looked for. See the try/except wrapping the whole body
     below (2026-09-08, second-pass code-review fix)."""
     try:
@@ -2985,7 +2985,7 @@ def _pending_dir_watcher_pass(seen):
     already claimed is simply gone from disk - this only ever acts on what
     the live path never got to. The age gate is what keeps this from ever
     racing a live, still-connected capture in the first place (those
-    normally finish in seconds, per own_manager.log)."""
+    normally finish in seconds, per slm_chitu_send.log)."""
     if not os.path.isdir(PENDING_DIR):
         return
     for name in os.listdir(PENDING_DIR):
@@ -3111,7 +3111,7 @@ def _chitubox_accept_loop(listen_sock):
         # that went stale WITHOUT a clean close (CHITUBOX crashed, the
         # machine slept/resumed, a network blip) left conn.recv() blocked
         # forever on a peer that no longer exists, and the listener could
-        # never accept() a new connection again - own_manager would go
+        # never accept() a new connection again - slm_chitu_send would go
         # completely deaf until manually restarted. Confirmed live
         # 2026-08-27: "Отправка по сети" stopped opening the picker
         # entirely (the slicer_file_watcher backstop still worked fine,
@@ -3138,7 +3138,7 @@ def _chitubox_accept_loop(listen_sock):
 def main():
     global controller
 
-    logmsg("=== own_manager started PID=%d ===", os.getpid())
+    logmsg("=== slm_chitu_send started PID=%d ===", os.getpid())
     logmsg("=== ScaleX: http://%s:%d ===", SCALEX_HOST, SCALEX_PORT)
 
     # Without this, Windows' taskbar groups every pythonw.exe-hosted window
@@ -3152,7 +3152,7 @@ def main():
     # "Python" taskbar identity entirely. Must be set before QApplication()
     # creates the first window.
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SolerSport.OwnManager.NetworkSending")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SolerSport.SlmChituSend.NetworkSending")
     except Exception as e:
         logmsg("=== SetCurrentProcessExplicitAppUserModelID FAILED (taskbar icon may show default): %s ===", e)
 
@@ -3181,7 +3181,7 @@ def main():
     ok = create_shared_memory(SHM_NAME, str(port))
     logmsg("=== shared memory created=%s ===", "yes" if ok else "NO")
     if not ok:
-        QMessageBox.critical(None, "own_manager", "Не удалось создать сегмент разделяемой памяти (см. лог). Выход.")
+        QMessageBox.critical(None, "slm_chitu_send", "Не удалось создать сегмент разделяемой памяти (см. лог). Выход.")
         return 1
 
     # CHITUBOX only ever opens one persistent connection - handling it in a
@@ -3189,13 +3189,13 @@ def main():
     # (app.exec() below blocks here for the process lifetime).
     threading.Thread(target=_chitubox_accept_loop, args=(listen_sock,), daemon=True).start()
 
-    print("own_manager running (Qt). Log: %s" % LOG_PATH)
+    print("slm_chitu_send running (Qt). Log: %s" % LOG_PATH)
     print("Picker windows open automatically on each capture; tray icon has manual send / log / exit.")
 
     try:
         ret = app.exec()
     finally:
-        logmsg("=== own_manager exiting ===")
+        logmsg("=== slm_chitu_send exiting ===")
         _logf.close()
     return ret
 

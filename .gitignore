@@ -3,3 +3,13 @@ __pycache__/
 .pytest_cache/
 htmlcov/
 .coverage
+
+# 2026-09-25: runtime data (pending/received captures, logs) now lives
+# under data/ inside the project root (merged in from the old separate
+# C:\own_manager) instead of a separate location - never belongs in git.
+data/
+goo_hook/*.dll
+goo_hook/*.exp
+goo_hook/*.lib
+goo_hook/*.obj
+!goo_hook/qml_probe.obj
