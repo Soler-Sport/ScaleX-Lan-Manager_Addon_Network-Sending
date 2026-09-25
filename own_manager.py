@@ -346,6 +346,159 @@ kernel32.MapViewOfFile.argtypes = [
     wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t,
 ]
 
+# ---------------------------------------------------------------------------
+# CHITUBOX Pro hook auto-injection (2026-09-25) - CreateRemoteThread +
+# LoadLibraryW, same technique ChituHook's own inject_by_pid.ps1 used, now
+# native here instead of shelling out to a separate script. Needed because a
+# static-import patch of CHITUBOX Pro.exe itself (the deploy method used
+# before this) gets blocked outright by the app's own Themida file-
+# integrity check as of the 2026-09-14 build - see goo_hook.c's module
+# comment for the full story. Explicit argtypes/restype throughout: on 64-
+# bit Windows, an undeclared ctypes function truncates any HANDLE/LPVOID
+# return value to 32 bits, which would silently corrupt every pointer this
+# code passes around.
+# ---------------------------------------------------------------------------
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.VirtualAllocEx.restype = wintypes.LPVOID
+kernel32.VirtualAllocEx.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD,
+]
+kernel32.WriteProcessMemory.restype = wintypes.BOOL
+kernel32.WriteProcessMemory.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, wintypes.LPCVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+]
+kernel32.CreateRemoteThread.restype = wintypes.HANDLE
+kernel32.CreateRemoteThread.argtypes = [
+    wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.LPVOID,
+    wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.GetExitCodeThread.restype = wintypes.BOOL
+kernel32.GetExitCodeThread.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetProcAddress.restype = wintypes.LPVOID
+kernel32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_char_p]
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.Process32FirstW.restype = wintypes.BOOL
+kernel32.Process32NextW.restype = wintypes.BOOL
+
+_PROCESS_ALL_ACCESS = 0x001F0FFF
+_MEM_COMMIT = 0x1000
+_MEM_RESERVE = 0x2000
+_TH32CS_SNAPPROCESS = 0x00000002
+_MAX_PATH = 260
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * _MAX_PATH),
+    ]
+
+
+GOO_HOOK_DLL_PATH = r"C:\ChituHook\goo_hook.dll"
+CHITUBOX_PRO_EXE_NAME = "CHITUBOX Pro.exe"
+
+
+def _list_pids_by_exe_name(exe_name):
+    """All live PIDs whose process image name matches `exe_name` (case-
+    insensitive) - a process snapshot walk, same primitive Task Manager
+    itself is built on."""
+    snap = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snap == wintypes.HANDLE(-1).value or not snap:
+        return []
+    pids = []
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+            while True:
+                if entry.szExeFile.lower() == exe_name.lower():
+                    pids.append(entry.th32ProcessID)
+                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snap)
+    return pids
+
+
+def _inject_goo_hook(pid, dll_path):
+    """CreateRemoteThread+LoadLibraryW injection of `dll_path` into `pid`.
+    Returns (ok, error_message)."""
+    hProcess = kernel32.OpenProcess(_PROCESS_ALL_ACCESS, False, pid)
+    if not hProcess:
+        return False, "OpenProcess failed, err=%d" % ctypes.get_last_error()
+    try:
+        path_bytes = (dll_path + "\0").encode("utf-16-le")
+        remote_mem = kernel32.VirtualAllocEx(
+            hProcess, None, len(path_bytes), _MEM_COMMIT | _MEM_RESERVE, PAGE_READWRITE)
+        if not remote_mem:
+            return False, "VirtualAllocEx failed, err=%d" % ctypes.get_last_error()
+        written = ctypes.c_size_t(0)
+        if not kernel32.WriteProcessMemory(hProcess, remote_mem, path_bytes, len(path_bytes), ctypes.byref(written)):
+            return False, "WriteProcessMemory failed, err=%d" % ctypes.get_last_error()
+        k32mod = kernel32.GetModuleHandleW("kernel32.dll")
+        load_lib_addr = kernel32.GetProcAddress(k32mod, b"LoadLibraryW")
+        if not load_lib_addr:
+            return False, "GetProcAddress(LoadLibraryW) failed, err=%d" % ctypes.get_last_error()
+        thread_id = wintypes.DWORD(0)
+        hThread = kernel32.CreateRemoteThread(
+            hProcess, None, 0, load_lib_addr, remote_mem, 0, ctypes.byref(thread_id))
+        if not hThread:
+            return False, "CreateRemoteThread failed, err=%d" % ctypes.get_last_error()
+        try:
+            kernel32.WaitForSingleObject(hThread, 10000)
+            exit_code = wintypes.DWORD(0)
+            kernel32.GetExitCodeThread(hThread, ctypes.byref(exit_code))
+        finally:
+            kernel32.CloseHandle(hThread)
+        if exit_code.value == 0:
+            return False, "LoadLibraryW returned NULL in target process"
+        return True, None
+    finally:
+        kernel32.CloseHandle(hProcess)
+
+
+def chitubox_hook_injector_loop():
+    """Background daemon thread - watches for new CHITUBOX Pro.exe processes
+    and injects goo_hook.dll into each one exactly once, so the ChituHook
+    model-list JSON (composition feature - see read_chitu_hook_model_names)
+    is there without the operator ever running a separate injector script
+    by hand. A PID is only ever attempted once, success or failure - a
+    process that's still starting up when first seen and fails is not worth
+    retrying every 5s for its whole lifetime, and a real, repeated failure
+    (e.g. a CHITUBOX Pro build whose Themida protection tightens further)
+    should show up once in the log per launch, not spam it forever. Skips
+    entirely, once, if goo_hook.dll isn't present (e.g. ChituHook was
+    removed from this machine)."""
+    if not os.path.isfile(GOO_HOOK_DLL_PATH):
+        logmsg("=== chitubox_hook_injector: %s not found, watcher disabled ===", GOO_HOOK_DLL_PATH)
+        return
+    logmsg("=== chitubox_hook_injector: watching for %s ===", CHITUBOX_PRO_EXE_NAME)
+    seen_pids = set()
+    while True:
+        try:
+            live_pids = set(_list_pids_by_exe_name(CHITUBOX_PRO_EXE_NAME))
+            seen_pids &= live_pids  # forget PIDs that have since exited
+            for pid in live_pids - seen_pids:
+                seen_pids.add(pid)
+                time.sleep(2)  # let the process clear its own very-early init before we touch it
+                ok, err = _inject_goo_hook(pid, GOO_HOOK_DLL_PATH)
+                logmsg("=== chitubox_hook_injector: %s pid=%d%s ===",
+                       "injected goo_hook.dll into" if ok else "FAILED to inject into",
+                       pid, "" if ok else " (%s)" % err)
+        except Exception as e:
+            logmsg("=== chitubox_hook_injector error: %s ===", e)
+        time.sleep(5)
+
+
 _shm_handle = None  # kept alive for the process lifetime, intentionally never closed
 _shm_view = None
 
@@ -466,6 +619,130 @@ def fetch_printers():
         return json.loads(body.decode("utf-8", "replace"))
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CTB composition (2026-09-24) - ScaleX's own "состав CTB" warehouse feature
+# (PUT /api/warehouse/ctb-mappings, reverse-engineered from its app.js) lets
+# an operator attach a list of {component_id, quantity} to a file name, for
+# stock tracking once a print finishes. Its own browser-side suggestion logic
+# (suggestedCtbCompositionArticles in app.js) only ever matches ONE component,
+# by substring-searching the .ctb's own file name - useless for a
+# multi-model plate with several different parts on it. ChituHook (and its
+# goo_hook.dll-merged successor, C:\ChituHook) hooks CHITUBOX Pro's own save
+# path and writes a flat JSON array of every model's original (pre-import)
+# filename next to the saved .ctb, same base name - see
+# C:\ChituHook\chitu_filelist_hook_pro.c's own header comment. That gives an
+# exact per-model list to match against warehouse component codes instead.
+# ---------------------------------------------------------------------------
+def fetch_warehouse_components():
+    conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=10)
+    try:
+        conn.request("GET", "/api/warehouse")
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 200:
+            raise RuntimeError("HTTP %d" % resp.status)
+        data = json.loads(body.decode("utf-8", "replace"))
+        return data.get("components") or []
+    finally:
+        conn.close()
+
+
+def save_ctb_composition(file_name, component_quantities):
+    """PUT /api/warehouse/ctb-mappings - {file_name, component_quantities:
+    [{component_id, quantity}]}. This REPLACES whatever composition ScaleX
+    already has for this file name, so callers must only call this with a
+    genuinely non-empty component_quantities (see PickerWindow's own
+    "matched or don't call this at all" guard) - an accidental empty write
+    here would silently wipe out a real composition an operator assigned by
+    hand through ScaleX's own UI."""
+    conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=15)
+    try:
+        body = json.dumps({
+            "file_name": file_name,
+            "component_quantities": [
+                {"component_id": cid, "quantity": qty} for cid, qty in component_quantities
+            ],
+        }).encode("utf-8")
+        conn.request("PUT", "/api/warehouse/ctb-mappings", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        if resp.status not in (200, 201, 202):
+            raise RuntimeError("HTTP %d: %s" % (resp.status, resp_body.decode("utf-8", "replace")[:300]))
+    finally:
+        conn.close()
+
+
+def read_chitu_hook_model_names(ctb_path):
+    """Looks for ChituHook/goo_hook's own sidecar JSON next to `ctb_path`
+    (same directory, same base name, ".json" extension) and returns its flat
+    list of original model file names, or None if there's no sidecar / it
+    isn't readable JSON. Best-effort and silent: a missing sidecar (hook
+    disabled or not installed - true by default as of 2026-09-24, see
+    goo_hook.c's InstallHooksThread, FL_InstallHook() is commented out there
+    pending isolated verification after an unrelated crash - or just an
+    older/manually-saved file) is the normal case, not an error worth
+    logging on every single capture."""
+    json_path = os.path.splitext(ctb_path)[0] + ".json"
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            names = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if n]
+
+
+def _normalize_composition_key(text):
+    """Shared by match_composition_components()'s two sides (model name
+    stem, component code) - exact match, but tolerant of formatting noise
+    that isn't a real difference: case, and whitespace ANYWHERE in the
+    string (not just leading/trailing - confirmed live 2026-09-25, real
+    model names came back as "WW-35033 _W_R_A.stl" with a space the
+    matching warehouse code "WW-35033_W_R_A" doesn't have, so every model
+    on that plate went unmatched under a plain .strip())."""
+    return re.sub(r"\s+", "", text).lower()
+
+
+def match_composition_components(model_names, components):
+    """Exact match (case-insensitive, whitespace- and extension-stripped) of
+    each model file name against a warehouse component - deliberately NOT
+    the substring/fuzzy match ScaleX's own browser code uses (see this
+    section's module-level comment), since that only ever surfaces one
+    guess. Returns (matched, unmatched): matched = list[(component_dict,
+    quantity)], one entry per distinct matched component, quantity = how
+    many times it appeared in model_names (a plate commonly prints several
+    copies of the same part). unmatched = the model names with no exact
+    match, so the picker can show the operator what it couldn't place
+    instead of silently dropping it.
+
+    Matches against BOTH a component's `code` and `name` fields - live data
+    confirmed 2026-09-25 that real STL file names correspond to `name`
+    ("WW-35033 _W_R_A"), not the shorter, colon-separated `code`
+    ("WW-35033W:RA") real files are never actually named after. Checking
+    both keeps this working for any other product family that *does*
+    happen to use code-style file names."""
+    by_code = {}
+    for c in components:
+        for key_field in ("code", "name"):
+            key = _normalize_composition_key(c.get(key_field) or "")
+            if key and key not in by_code:
+                by_code[key] = c
+    counts = {}
+    unmatched = []
+    for name in model_names:
+        stem = _normalize_composition_key(os.path.splitext(name)[0])
+        comp = by_code.get(stem)
+        if comp:
+            counts[comp["id"]] = counts.get(comp["id"], 0) + 1
+        else:
+            unmatched.append(name)
+    comp_by_id = {c["id"]: c for c in components}
+    matched = [(comp_by_id[cid], qty) for cid, qty in counts.items()]
+    return matched, unmatched
 
 
 def _progress_from_status(status):
@@ -1518,6 +1795,7 @@ class PickerWindow(QMainWindow):
     _progress_signal = Signal(str, object, list)   # phase, percent(float|None), targets(list[dict])
     _printers_signal = Signal(list, str)           # printers, error message ("" if ok)
     _retry_signal = Signal(list)                   # targets(list[dict]) - one row's own retry, not the whole-batch state
+    _composition_signal = Signal(list, str)        # warehouse components, error message ("" if ok)
 
     def __init__(self, file_path, filename, machine_name, chitubox_conn=None):
         super().__init__()
@@ -1535,6 +1813,16 @@ class PickerWindow(QMainWindow):
             self.file_size = os.path.getsize(file_path)
         except OSError:
             self.file_size = None  # memory_fit_label just stays hidden on every row rather than guessing
+        # 2026-09-24: ChituHook/goo_hook's per-model sidecar JSON, if one
+        # landed next to this capture (see read_chitu_hook_model_names) -
+        # empty when the hook is disabled/not installed (its default state
+        # as of this writing) or the file was saved before this feature
+        # existed. composition_matched/unmatched are filled in once
+        # _start_fetch_composition()'s background fetch of ScaleX's
+        # warehouse components resolves - see _on_composition_loaded.
+        self.model_names = read_chitu_hook_model_names(file_path) or []
+        self.composition_matched = []    # list[(component_dict, quantity)]
+        self.composition_unmatched = []  # list[str] - model names with no exact code match
         self.rows = {}       # printer_id -> PrinterRowWidget
         self.sending = False
         self._loaded_once = False
@@ -1585,16 +1873,36 @@ class PickerWindow(QMainWindow):
         self.filename_edit = QLineEdit(filename)
         form.addWidget(self.filename_edit)
 
-        form.addWidget(self._field_label("Поиск принтера"))
+        # 2026-09-25 (user request): hidden, not removed - never actually
+        # used in practice, but _render_list()/matches_filters() still read
+        # self.search_edit.text() (always "" now), so keeping the widget
+        # around means no changes needed to that filtering logic or its
+        # tests, just nothing visible to type into.
+        search_label = self._field_label("Поиск принтера")
+        search_label.setVisible(False)
+        form.addWidget(search_label)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("имя, IP, модель…")
         self.search_edit.textChanged.connect(self._render_list)
+        self.search_edit.setVisible(False)
         form.addWidget(self.search_edit)
 
         self.machine_notice = QLabel()
         self.machine_notice.setObjectName("machineNotice")
         self.machine_notice.setVisible(False)
         form.addWidget(self.machine_notice)
+
+        # 2026-09-24: composition (ChituHook model list -> ScaleX warehouse
+        # components, see match_composition_components) - review-only panel;
+        # actually saved to ScaleX in _on_send_clicked, alongside the send
+        # itself, not from a separate button (per user request). Hidden
+        # entirely unless a ChituHook sidecar was actually found for this
+        # capture - see model_names above.
+        self.composition_notice = QLabel()
+        self.composition_notice.setObjectName("machineNotice")
+        self.composition_notice.setWordWrap(True)
+        self.composition_notice.setVisible(False)
+        form.addWidget(self.composition_notice)
 
         filters_row = QHBoxLayout()
         self.online_only_cb = QCheckBox("Показывать включённые")
@@ -1661,18 +1969,22 @@ class PickerWindow(QMainWindow):
         self.actions_row = actions_row
         form.addLayout(actions_row)
 
-        self.filename_edit.returnPressed.connect(self.search_edit.setFocus)
-        self.search_edit.returnPressed.connect(self.send_btn.click)
+        self.filename_edit.returnPressed.connect(self.send_btn.click)
 
         self._progress_signal.connect(self._on_progress, Qt.QueuedConnection)
         self._printers_signal.connect(self._on_printers_loaded, Qt.QueuedConnection)
         self._retry_signal.connect(self._on_retry_progress, Qt.QueuedConnection)
+        self._composition_signal.connect(self._on_composition_loaded, Qt.QueuedConnection)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(5000)
         self._refresh_timer.timeout.connect(self._start_fetch_printers)
 
         self._start_fetch_printers(initial=True)
+        if self.model_names:
+            self.composition_notice.setText("Состав СТБ: подбираю совпадения по данным ChituHook…")
+            self.composition_notice.setVisible(True)
+            self._start_fetch_composition()
 
     @staticmethod
     def _field_label(text):
@@ -1735,6 +2047,63 @@ class PickerWindow(QMainWindow):
         self._render_list()
         if not self._refresh_timer.isActive():
             self._refresh_timer.start()
+
+    # -- composition (ChituHook -> ScaleX warehouse components) -------------
+    def _start_fetch_composition(self):
+        def worker():
+            try:
+                components = fetch_warehouse_components()
+                self._composition_signal.emit(components, "")
+            except Exception as e:
+                self._composition_signal.emit([], str(e))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_composition_loaded(self, components, error):
+        if error:
+            logmsg("=== COMPOSITION: failed to fetch ScaleX warehouse components: %s ===", error)
+            self.composition_notice.setVisible(False)
+            return
+        self.composition_matched, self.composition_unmatched = \
+            match_composition_components(self.model_names, components)
+        if not self.composition_matched and not self.composition_unmatched:
+            self.composition_notice.setVisible(False)
+            return
+        parts = []
+        if self.composition_matched:
+            items = ", ".join(
+                "%s×%d" % ((c.get("name") or c.get("code")), qty)
+                for c, qty in self.composition_matched)
+            parts.append("Состав СТБ (по данным ChituHook, уйдёт в ScaleX при отправке): %s" % items)
+        else:
+            parts.append("Состав СТБ: ни одна модель с плиты не совпала со складским кодом")
+        if self.composition_unmatched:
+            parts.append("Без совпадения (%d): %s" % (
+                len(self.composition_unmatched), ", ".join(self.composition_unmatched)))
+        self.composition_notice.setText("\n".join(parts))
+        self.composition_notice.setVisible(True)
+
+    def _save_composition_in_background(self, file_name):
+        """Fired from _on_send_clicked, alongside the actual file send - see
+        this class's own composition_notice comment for why there's no
+        separate button. Best-effort: a failure here is logged only, never
+        surfaced to the operator or allowed to block/fail the real send,
+        since this is supplementary warehouse bookkeeping, not the transfer
+        itself. Deliberately does nothing at all when nothing matched -
+        save_ctb_composition() REPLACES ScaleX's existing composition for
+        this file name, so calling it with an empty list here would silently
+        wipe out a real one an operator assigned by hand."""
+        matched = self.composition_matched
+        if not matched:
+            return
+        quantities = [(c["id"], qty) for c, qty in matched]
+
+        def worker():
+            try:
+                save_ctb_composition(file_name, quantities)
+                logmsg("=== COMPOSITION: saved %d component(s) for %s ===", len(quantities), file_name)
+            except Exception as e:
+                logmsg("=== COMPOSITION: failed to save for %s: %s ===", file_name, e)
+        threading.Thread(target=worker, daemon=True).start()
 
     # -- filtering/rendering -------------------------------------------------
     def _render_list(self):
@@ -1813,6 +2182,7 @@ class PickerWindow(QMainWindow):
             display_name += src_ext
         self._last_display_name = display_name  # reused by a later single-row retry
         self._last_start_print = start_print
+        self._save_composition_in_background(display_name)
 
         self.sending = True
         self._refresh_timer.stop()
@@ -2174,6 +2544,26 @@ LOADWINDOW_CLOSE_NOTIFY = (
 
 REQUEST_COOLDOWN_SEC = 4.0  # collapse CHITUBOX's retry-burst pings into one request
 
+# 2026-09-09: CHITUBOX resets its own TCP connection to us every ~5-6
+# minutes regardless of activity (confirmed live - "handle_client FAILED
+# ...: [WinError 10054] ... принудительно разорвал существующее
+# подключение", twice, ~5.5 min apart, during an otherwise-idle stretch).
+# own_manager's accept loop handles that fine (new connection, clean
+# state) - but a genuinely long slice (a big multi-part plate) that
+# outlives that window orphans whatever SaveFile request was in flight:
+# handle_client()'s thread dies with the dead connection before CHITUBOX
+# ever gets to send its SaveFile reply, even though CHITUBOX itself may
+# well keep slicing and finish writing the file to PENDING_DIR anyway -
+# there's just nobody left listening on that connection to notice. See
+# _pending_dir_watcher() below, added for exactly this - a user-observed,
+# not directly logged, failure mode ("на этом сообщении был очень долгий
+# слайс").
+PENDING_ORPHAN_GRACE_SEC = 120  # deliberately generous - real jobs finish
+# their live round-trip in seconds to low tens of seconds per
+# own_manager.log's own timings; this only needs to be comfortably shorter
+# than the ~5-6 min reset window and comfortably longer than normal
+# variance, not tightly tuned.
+
 
 class _ChituboxConn:
     """2026-09-08 (code-review fix, findings #4/#5): thread-safe wrapper
@@ -2267,6 +2657,24 @@ def _looks_like_native_v3_goo(path):
         return False
 
 
+def _copy_chitu_hook_sidecar(send_path, dest):
+    """Best-effort copy of ChituHook/goo_hook's own sidecar <basename>.json
+    (see read_chitu_hook_model_names/match_composition_components and
+    PickerWindow's "Состав" panel) from next to send_path to next to dest,
+    so it survives send_path's own removal a few lines below in every
+    _capture_and_emit() caller. A missing sidecar (hook disabled/not
+    installed, or an older capture from before this feature) is the normal
+    case, not an error."""
+    src_json = os.path.splitext(send_path)[0] + ".json"
+    if not os.path.isfile(src_json):
+        return
+    dest_json = os.path.splitext(dest)[0] + ".json"
+    try:
+        shutil.copy2(src_json, dest_json)
+    except OSError as e:
+        logmsg("=== failed to copy ChituHook sidecar %s: %s ===", src_json, e)
+
+
 def _capture_and_emit(send_path, chandle):
     """Shared by handle_client()'s two SaveFile-reply capture paths (plain
     .ctb inline; Jupiter-2 .goo on its own thread, see
@@ -2282,6 +2690,7 @@ def _capture_and_emit(send_path, chandle):
         shutil.copy2(send_path, dest)
         logmsg("=== CTB CAPTURED via direct request: %s -> %s (%d bytes) ===",
                send_path, dest, os.path.getsize(dest))
+        _copy_chitu_hook_sidecar(send_path, dest)
         # send_path (in PENDING_DIR) was only ever a staging copy for
         # CHITUBOX/goo_hook to write into - dest (in RECEIVED_DIR) is the
         # real, permanent one. Nothing ever reads it again once this copy
@@ -2536,6 +2945,7 @@ def slicer_file_watcher():
                             shutil.copy2(path, dest)
                             logmsg("=== SLICER FILE CAPTURED: %s -> %s (%d bytes) ===",
                                    path, dest, os.path.getsize(dest))
+                            _copy_chitu_hook_sidecar(path, dest)
                         except Exception as e:
                             logmsg("=== SLICER FILE CAPTURE FAILED: %s (%s) ===", path, e)
                             continue
@@ -2543,6 +2953,104 @@ def slicer_file_watcher():
                         controller.file_captured.emit(dest, None)
         except Exception as e:
             logmsg("=== slicer_file_watcher error: %s ===", e)
+        time.sleep(POLL_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
+# Second backstop, 2026-09-09 - catches a PENDING_DIR file CHITUBOX actually
+# finished writing even when the TCP connection that requested it died
+# first (see PENDING_ORPHAN_GRACE_SEC's own comment above for why this
+# happens - a slice that outlives CHITUBOX's own ~5-6 min connection-reset
+# window orphans handle_client()'s in-flight SaveFile request). Deliberately
+# NOT tied to how long the slice actually takes: this only reacts to what's
+# sitting on disk, so it works the same whether a job takes 10 seconds or
+# 20 minutes.
+# ---------------------------------------------------------------------------
+def _pending_dir_watcher_pass(seen):
+    """One scan of PENDING_DIR - pulled out of _pending_dir_watcher()'s own
+    while loop so it's directly callable (and testable) without needing to
+    run that infinite loop. Mutates `seen` in place, same contract as
+    slicer_file_watcher() above.
+
+    Reuses the exact same seen-set + stability-wait shape as
+    slicer_file_watcher(), and the same _capture_and_emit()/
+    _finish_goo_v5_capture() helpers handle_client() itself calls - not a
+    parallel reimplementation of capture logic, just a second way of
+    noticing a file is ready.
+
+    No special coordination needed against the live handle_client() path:
+    _capture_and_emit() removes its own PENDING copy immediately after a
+    successful capture, so by the time this pass's PENDING_ORPHAN_GRACE_SEC
+    age gate plus its own stability wait finish, a file the live connection
+    already claimed is simply gone from disk - this only ever acts on what
+    the live path never got to. The age gate is what keeps this from ever
+    racing a live, still-connected capture in the first place (those
+    normally finish in seconds, per own_manager.log)."""
+    if not os.path.isdir(PENDING_DIR):
+        return
+    for name in os.listdir(PENDING_DIR):
+        if name.startswith("v5_"):
+            # goo_hook.dll's own converted sibling of another candidate in
+            # this same directory (see rename_with_v5_prefix() in
+            # goo_hook.c) - never a fresh request in its own right.
+            # Whichever code path is actually waiting on THAT candidate
+            # (either handle_client()'s own _finish_goo_v5_capture thread,
+            # or this watcher's own handling of the non-prefixed candidate
+            # below) is responsible for it; treating it as a second,
+            # independent top-level file here would just waste a full 60s
+            # wait on a nonsensical double-prefixed "v5_v5_..." lookup.
+            continue
+        if not name.lower().endswith(SLICE_EXTENSIONS):
+            # 2026-09-25: ChituHook/goo_hook's own <basename>.json sidecar
+            # (see read_chitu_hook_model_names) lands right next to its .ctb
+            # in this same directory - not a slice file, and this watcher
+            # has no live connection to remove it once _capture_and_emit()
+            # copies its .ctb sibling into RECEIVED_DIR, so it just sits
+            # here until PENDING_ORPHAN_GRACE_SEC and got mistaken for an
+            # orphaned capture, opening the picker on the .json itself.
+            continue
+        path = os.path.join(PENDING_DIR, name)
+        if path in seen or not os.path.isfile(path):
+            continue
+        try:
+            age = time.time() - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age < PENDING_ORPHAN_GRACE_SEC:
+            # Still well within the live connection's normal window - not
+            # our business yet, don't mark it "seen" either so we re-check
+            # its age next pass.
+            continue
+        seen.add(path)
+
+        _wait_for_stable_file(path, max_polls=30)  # up to ~6s extra margin
+        if not os.path.isfile(path):
+            # The live connection claimed and removed it right as we were
+            # about to - the rare near-miss, nothing to do.
+            continue
+
+        logmsg("=== PENDING_DIR watcher: orphaned capture found "
+               "(untouched for %.0fs - connection likely died mid-slice): %s ===",
+               age, path)
+        if path.lower().endswith(".goo"):
+            _finish_goo_v5_capture(path, None)
+        else:
+            _capture_and_emit(path, None)
+
+
+def _pending_dir_watcher():
+    logmsg("=== _pending_dir_watcher: watching %s (orphan grace period %ds) ===",
+           PENDING_DIR, PENDING_ORPHAN_GRACE_SEC)
+    seen = set()
+    if os.path.isdir(PENDING_DIR):
+        for name in os.listdir(PENDING_DIR):
+            seen.add(os.path.join(PENDING_DIR, name))
+
+    while True:
+        try:
+            _pending_dir_watcher_pass(seen)
+        except Exception as e:
+            logmsg("=== _pending_dir_watcher error: %s ===", e)
         time.sleep(POLL_INTERVAL_SEC)
 
 
@@ -2659,7 +3167,9 @@ def main():
     tray, tray_menu, tray_actions = build_tray_icon(app)  # noqa: F841 - refs kept alive deliberately
 
     threading.Thread(target=slicer_file_watcher, daemon=True).start()
+    threading.Thread(target=_pending_dir_watcher, daemon=True).start()
     threading.Thread(target=_received_dir_cleanup_loop, daemon=True).start()
+    threading.Thread(target=chitubox_hook_injector_loop, daemon=True).start()
 
     listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
