@@ -57,18 +57,28 @@ class TestMatchCompositionComponents:
         {"id": "comp-2", "code": "WM-24001W:RA", "name": "WM-24001W R A"},
     ]
 
+    # Two different articles that happen to share one name - the case this
+    # class's ambiguous-match tests exercise (see match_composition_components'
+    # own docstring, and PickerWindow._rebuild_composition_ambiguous_rows).
+    SAME_NAME_COMPONENTS = [
+        {"id": "comp-a1", "code": "ART-001", "name": "Кронштейн универсальный"},
+        {"id": "comp-a2", "code": "ART-002", "name": "Кронштейн универсальный"},
+    ]
+
     def test_exact_match_is_case_insensitive_and_extension_stripped(self):
-        matched, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
             ["wm-24001w:la.stl"], self.COMPONENTS)
 
         assert matched == [(self.COMPONENTS[0], 1)]
+        assert ambiguous == []
         assert unmatched == []
 
     def test_counts_repeated_models_as_quantity(self):
-        matched, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
             ["WM-24001W:LA.stl", "WM-24001W:LA.stl", "WM-24001W:LA.stl"], self.COMPONENTS)
 
         assert matched == [(self.COMPONENTS[0], 3)]
+        assert ambiguous == []
         assert unmatched == []
 
     def test_no_substring_matching(self):
@@ -76,26 +86,61 @@ class TestMatchCompositionComponents:
         # has a ":LA"/":RA" suffix it lacks) - a model name that only
         # partially overlaps a code must NOT match. This is the whole point
         # of not reusing ScaleX's own fuzzy browser-side logic.
-        matched, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
             ["WM-24001W.stl"], self.COMPONENTS)
 
         assert matched == []
+        assert ambiguous == []
         assert unmatched == ["WM-24001W.stl"]
 
     def test_unrecognized_model_goes_to_unmatched(self):
-        matched, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
             ["some_unrelated_part.stl"], self.COMPONENTS)
 
         assert matched == []
+        assert ambiguous == []
         assert unmatched == ["some_unrelated_part.stl"]
 
     def test_mixed_matched_and_unmatched(self):
-        matched, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
             ["WM-24001W:LA.stl", "mystery_part.stl", "WM-24001W:RA.stl"], self.COMPONENTS)
 
         assert sorted(matched, key=lambda pair: pair[0]["id"]) == [
             (self.COMPONENTS[0], 1), (self.COMPONENTS[1], 1)]
+        assert ambiguous == []
         assert unmatched == ["mystery_part.stl"]
+
+    def test_same_name_different_article_is_ambiguous_not_silently_picked(self):
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+            ["Кронштейн универсальный.stl"], self.SAME_NAME_COMPONENTS)
+
+        assert matched == []
+        assert unmatched == []
+        assert len(ambiguous) == 1
+        model_name, candidates, quantity = ambiguous[0]
+        assert model_name == "Кронштейн универсальный.stl"
+        assert quantity == 1
+        assert sorted(candidates, key=lambda c: c["id"]) == self.SAME_NAME_COMPONENTS
+
+    def test_ambiguous_match_counts_repeats_as_one_group(self):
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+            ["Кронштейн универсальный.stl", "Кронштейн универсальный.stl"], self.SAME_NAME_COMPONENTS)
+
+        assert matched == []
+        assert unmatched == []
+        assert len(ambiguous) == 1
+        _, candidates, quantity = ambiguous[0]
+        assert quantity == 2
+        assert len(candidates) == 2
+
+    def test_ambiguous_and_unambiguous_matches_stay_independent(self):
+        components = self.COMPONENTS + self.SAME_NAME_COMPONENTS
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+            ["WM-24001W:LA.stl", "Кронштейн универсальный.stl"], components)
+
+        assert matched == [(self.COMPONENTS[0], 1)]
+        assert len(ambiguous) == 1
+        assert unmatched == []
 
 
 class TestFetchWarehouseComponents:

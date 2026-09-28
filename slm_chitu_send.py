@@ -115,6 +115,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QCheckBox, QPushButton, QScrollArea, QProgressBar,
     QSystemTrayIcon, QMenu, QFileDialog, QSizePolicy, QFrame, QMessageBox,
+    QComboBox,
 )
 
 try:
@@ -712,12 +713,25 @@ def match_composition_components(model_names, components):
     each model file name against a warehouse component - deliberately NOT
     the substring/fuzzy match ScaleX's own browser code uses (see this
     section's module-level comment), since that only ever surfaces one
-    guess. Returns (matched, unmatched): matched = list[(component_dict,
-    quantity)], one entry per distinct matched component, quantity = how
-    many times it appeared in model_names (a plate commonly prints several
-    copies of the same part). unmatched = the model names with no exact
-    match, so the picker can show the operator what it couldn't place
-    instead of silently dropping it.
+    guess. Returns (matched, ambiguous, unmatched):
+
+    - matched = list[(component_dict, quantity)], one entry per distinct,
+      UNAMBIGUOUSLY matched component - quantity = how many times it
+      appeared in model_names (a plate commonly prints several copies of
+      the same part).
+    - ambiguous = list[(model_name, candidates, quantity)] for any model
+      name whose normalized key matches MORE THAN ONE component - this
+      happens when the warehouse has several components under different
+      articles/codes that share the exact same name (confirmed live
+      2026-09-28). There's no correct automatic choice here - which
+      article is "the" target for that name is a warehouse-stock decision,
+      not something derivable from the CTB/model data - so these are
+      surfaced separately for the operator to resolve instead of silently
+      picking whichever component happened to come first in the warehouse
+      list (the old behavior - see the picker's composition UI).
+    - unmatched = the model names with no match at all, so the picker can
+      show the operator what it couldn't place instead of silently
+      dropping it.
 
     Matches against BOTH a component's `code` and `name` fields - live data
     confirmed 2026-09-25 that real STL file names correspond to `name`
@@ -725,24 +739,36 @@ def match_composition_components(model_names, components):
     ("WW-35033W:RA") real files are never actually named after. Checking
     both keeps this working for any other product family that *does*
     happen to use code-style file names."""
-    by_code = {}
+    by_key = {}
     for c in components:
         for key_field in ("code", "name"):
             key = _normalize_composition_key(c.get(key_field) or "")
-            if key and key not in by_code:
-                by_code[key] = c
+            if not key:
+                continue
+            group = by_key.setdefault(key, [])
+            if not any(existing["id"] == c["id"] for existing in group):
+                group.append(c)
+
     counts = {}
+    ambiguous_groups = {}  # stem -> {"model_name": str, "candidates": [...], "quantity": int}
     unmatched = []
     for name in model_names:
         stem = _normalize_composition_key(os.path.splitext(name)[0])
-        comp = by_code.get(stem)
-        if comp:
-            counts[comp["id"]] = counts.get(comp["id"], 0) + 1
-        else:
+        candidates = by_key.get(stem)
+        if not candidates:
             unmatched.append(name)
+        elif len(candidates) == 1:
+            cid = candidates[0]["id"]
+            counts[cid] = counts.get(cid, 0) + 1
+        else:
+            group = ambiguous_groups.setdefault(
+                stem, {"model_name": name, "candidates": candidates, "quantity": 0})
+            group["quantity"] += 1
+
     comp_by_id = {c["id"]: c for c in components}
     matched = [(comp_by_id[cid], qty) for cid, qty in counts.items()]
-    return matched, unmatched
+    ambiguous = [(g["model_name"], g["candidates"], g["quantity"]) for g in ambiguous_groups.values()]
+    return matched, ambiguous, unmatched
 
 
 def _progress_from_status(status):
@@ -1822,7 +1848,9 @@ class PickerWindow(QMainWindow):
         # warehouse components resolves - see _on_composition_loaded.
         self.model_names = read_chitu_hook_model_names(file_path) or []
         self.composition_matched = []    # list[(component_dict, quantity)]
+        self.composition_ambiguous = []  # list[(model_name, candidates, quantity)] - see match_composition_components
         self.composition_unmatched = []  # list[str] - model names with no exact code match
+        self.composition_choice_combos = {}  # model_name -> QComboBox, one per ambiguous group (operator's article pick)
         self.rows = {}       # printer_id -> PrinterRowWidget
         self.sending = False
         self._loaded_once = False
@@ -1903,6 +1931,20 @@ class PickerWindow(QMainWindow):
         self.composition_notice.setWordWrap(True)
         self.composition_notice.setVisible(False)
         form.addWidget(self.composition_notice)
+
+        # 2026-09-28 (user request): one name shared by several warehouse
+        # articles has no automatically-correct choice (see
+        # match_composition_components' "ambiguous" return) - one combo box
+        # per ambiguous model name lets the operator pick the target
+        # article. Built lazily in _on_composition_loaded() once the actual
+        # ambiguous groups (if any) are known; stays empty/invisible
+        # otherwise.
+        self.composition_ambiguous_widget = QWidget()
+        self.composition_ambiguous_layout = QVBoxLayout(self.composition_ambiguous_widget)
+        self.composition_ambiguous_layout.setContentsMargins(0, 0, 0, 0)
+        self.composition_ambiguous_layout.setSpacing(4)
+        self.composition_ambiguous_widget.setVisible(False)
+        form.addWidget(self.composition_ambiguous_widget)
 
         filters_row = QHBoxLayout()
         self.online_only_cb = QCheckBox("Показывать включённые")
@@ -2063,9 +2105,10 @@ class PickerWindow(QMainWindow):
             logmsg("=== COMPOSITION: failed to fetch ScaleX warehouse components: %s ===", error)
             self.composition_notice.setVisible(False)
             return
-        self.composition_matched, self.composition_unmatched = \
+        self.composition_matched, self.composition_ambiguous, self.composition_unmatched = \
             match_composition_components(self.model_names, components)
-        if not self.composition_matched and not self.composition_unmatched:
+        self._rebuild_composition_ambiguous_rows()
+        if not self.composition_matched and not self.composition_ambiguous and not self.composition_unmatched:
             self.composition_notice.setVisible(False)
             return
         parts = []
@@ -2074,13 +2117,44 @@ class PickerWindow(QMainWindow):
                 "%s×%d" % ((c.get("name") or c.get("code")), qty)
                 for c, qty in self.composition_matched)
             parts.append("Состав СТБ (по данным ChituHook, уйдёт в ScaleX при отправке): %s" % items)
-        else:
+        elif not self.composition_ambiguous:
             parts.append("Состав СТБ: ни одна модель с плиты не совпала со складским кодом")
+        if self.composition_ambiguous:
+            parts.append("Несколько артикулов с одним названием (%d) - выберите целевой артикул ниже:" %
+                          len(self.composition_ambiguous))
         if self.composition_unmatched:
             parts.append("Без совпадения (%d): %s" % (
                 len(self.composition_unmatched), ", ".join(self.composition_unmatched)))
         self.composition_notice.setText("\n".join(parts))
         self.composition_notice.setVisible(True)
+
+    def _rebuild_composition_ambiguous_rows(self):
+        """One row per ambiguous match (see match_composition_components):
+        a label naming the model + quantity, and a combo box of candidate
+        components (same name, different article/code) for the operator to
+        pick the target article from. Rebuilt from scratch on every
+        composition load (only actually happens once per picker window, but
+        cheap and avoids stale rows if that ever changes)."""
+        while self.composition_ambiguous_layout.count():
+            item = self.composition_ambiguous_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self.composition_choice_combos = {}
+        for model_name, candidates, quantity in self.composition_ambiguous:
+            row = QHBoxLayout()
+            label = QLabel("%s ×%d:" % (model_name, quantity))
+            row.addWidget(label)
+            combo = QComboBox()
+            for c in candidates:
+                option_label = c.get("code") or c.get("id")
+                combo.addItem(str(option_label), c)
+            row.addWidget(combo, 1)
+            self.composition_choice_combos[model_name] = combo
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            self.composition_ambiguous_layout.addWidget(row_widget)
+        self.composition_ambiguous_widget.setVisible(bool(self.composition_ambiguous))
 
     def _save_composition_in_background(self, file_name):
         """Fired from _on_send_clicked, alongside the actual file send - see
@@ -2091,11 +2165,22 @@ class PickerWindow(QMainWindow):
         itself. Deliberately does nothing at all when nothing matched -
         save_ctb_composition() REPLACES ScaleX's existing composition for
         this file name, so calling it with an empty list here would silently
-        wipe out a real one an operator assigned by hand."""
-        matched = self.composition_matched
-        if not matched:
+        wipe out a real one an operator assigned by hand.
+
+        Ambiguous matches (see match_composition_components) are resolved
+        here from whatever article is currently selected in each combo box
+        built by _rebuild_composition_ambiguous_rows() - read at send time,
+        not at load time, so a last-second change of selection is honored."""
+        counts = {}
+        for c, qty in self.composition_matched:
+            counts[c["id"]] = counts.get(c["id"], 0) + qty
+        for model_name, candidates, quantity in self.composition_ambiguous:
+            combo = self.composition_choice_combos.get(model_name)
+            chosen = combo.currentData() if combo else candidates[0]
+            counts[chosen["id"]] = counts.get(chosen["id"], 0) + quantity
+        if not counts:
             return
-        quantities = [(c["id"], qty) for c, qty in matched]
+        quantities = list(counts.items())
 
         def worker():
             try:
