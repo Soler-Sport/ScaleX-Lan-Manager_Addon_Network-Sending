@@ -2396,7 +2396,12 @@ class PickerWindow(QMainWindow):
                 row.rec_checkbox.setEnabled(True)
 
     def closeEvent(self, event):
-        logmsg("=== picker window closed: %s ===", self.filename)
+        try:
+            _open_windows.remove(self)
+        except ValueError:
+            pass
+        logmsg("=== picker window closed: %s (%d other picker window(s) still open) ===",
+               self.filename, len(_open_windows))
         # 2026-09-08 (experimental, see LOADWINDOW_CLOSE_NOTIFY's comment):
         # tell CHITUBOX this window is gone, unprompted.
         #
@@ -2413,20 +2418,34 @@ class PickerWindow(QMainWindow):
         # matter how long the send takes; _ChituboxConn.send() is already
         # thread-safe (see its own docstring), so this is safe to do from
         # here without any extra locking on this end.
-        if self.chitubox_conn is not None:
-            chandle = self.chitubox_conn
+        #
+        # 2026-09-29 (investigating "Network sending sometimes does
+        # nothing" report): CHITUBOX's own "MainProgramHandle" is the same
+        # across every message regardless of which capture it's tied to -
+        # its own network-send UI state looks like a single global
+        # Visible/not-visible flag, not one per plate/window. Several
+        # PickerWindows can be open at once here (one per captured file),
+        # so blindly sending Visible:false when ANY one of them closes
+        # could tell CHITUBOX "my send window is gone" while a sibling
+        # window from the SAME connection is still genuinely open on
+        # screen - plausible way for CHITUBOX's own state to get out of
+        # sync with reality and start silently ignoring the next click.
+        # Only notify when this was the last open window sharing this
+        # exact connection.
+        chandle = self.chitubox_conn
+        if chandle is not None:
+            still_open = any(w.chitubox_conn is chandle for w in _open_windows)
             filename = self.filename
+            if still_open:
+                logmsg("=== close notify SKIPPED for %s: another picker window on the same "
+                       "CHITUBOX connection is still open ===", filename)
+            else:
+                def _notify():
+                    ok = chandle.send(LOADWINDOW_CLOSE_NOTIFY)
+                    logmsg("=== %s LoadWindow(Visible:false) close notify for %s ===",
+                           "SENT" if ok else "SKIPPED (connection already gone)", filename)
 
-            def _notify():
-                ok = chandle.send(LOADWINDOW_CLOSE_NOTIFY)
-                logmsg("=== %s LoadWindow(Visible:false) close notify for %s ===",
-                       "SENT" if ok else "SKIPPED (connection already gone)", filename)
-
-            threading.Thread(target=_notify, daemon=True).start()
-        try:
-            _open_windows.remove(self)
-        except ValueError:
-            pass
+                threading.Thread(target=_notify, daemon=True).start()
         super().closeEvent(event)
 
 
@@ -2465,7 +2484,12 @@ def open_picker_window(dest_path, chitubox_conn=None):
     PickerWindow.closeEvent."""
     filename = _clean_display_filename(os.path.basename(dest_path))
     machine_name = extract_ctb_machine_name(dest_path)
-    logmsg("=== OPENING PICKER: %s (machine=%r) ===", filename, machine_name)
+    # 2026-09-29: sibling count logged here too (see closeEvent's own
+    # comment) - correlating this against a later "Network sending did
+    # nothing" report shows whether CHITUBOX's own send-UI state was
+    # already juggling more than one open window at the time.
+    logmsg("=== OPENING PICKER: %s (machine=%r, %d other picker window(s) already open) ===",
+           filename, machine_name, len(_open_windows))
     win = PickerWindow(dest_path, filename, machine_name, chitubox_conn=chitubox_conn)
     win.show()
     force_window_to_foreground(win)
