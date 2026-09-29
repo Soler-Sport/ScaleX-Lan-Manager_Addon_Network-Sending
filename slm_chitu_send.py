@@ -771,6 +771,20 @@ def match_composition_components(model_names, components):
     return matched, ambiguous, unmatched
 
 
+def _composition_item_label(component):
+    """'name (арт. code)' for the composition notice - shows the actual
+    detected article alongside the name, since confirming *which* article
+    got matched is the useful thing to glance at before sending, not just
+    that something matched. Falls back to whichever of name/code exists
+    when the other is missing, and avoids a redundant "X (арт. X)" when
+    they're identical."""
+    name = component.get("name")
+    code = component.get("code")
+    if name and code and name != code:
+        return "%s (арт. %s)" % (name, code)
+    return name or code or component.get("id") or "?"
+
+
 def _progress_from_status(status):
     """Best-effort (percent, message) out of either ScaleX status shape:
     /api/uploads/{id} (flat percent/stage) or /api/bulk-uploads/{id}
@@ -2113,10 +2127,15 @@ class PickerWindow(QMainWindow):
             return
         parts = []
         if self.composition_matched:
+            # 2026-09-29 (user request): show the actual detected article
+            # per component instead of a generic "this came from ChituHook"
+            # caption - the article is the useful thing to glance at here
+            # (e.g. to confirm it's the right one before sending), the
+            # mechanism explanation is not.
             items = ", ".join(
-                "%s×%d" % ((c.get("name") or c.get("code")), qty)
+                "%s×%d" % (_composition_item_label(c), qty)
                 for c, qty in self.composition_matched)
-            parts.append("Состав СТБ (по данным ChituHook, уйдёт в ScaleX при отправке): %s" % items)
+            parts.append("Состав СТБ: %s" % items)
         elif not self.composition_ambiguous:
             parts.append("Состав СТБ: ни одна модель с плиты не совпала со складским кодом")
         if self.composition_ambiguous:
