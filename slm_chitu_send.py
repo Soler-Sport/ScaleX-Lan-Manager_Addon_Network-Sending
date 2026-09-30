@@ -2301,7 +2301,21 @@ class PickerWindow(QMainWindow):
             pass  # left visible, harmless
 
         for pid, row in self.rows.items():
-            row.set_locked_for_send(pid in selected_ids)
+            selected = pid in selected_ids
+            # 2026-09-30 (user report: sending to an already-printing
+            # printer visually "squished its card into another one"): a row
+            # checked before its printer went busy (with "Скрывать занятые"
+            # on) gets filtered OUT of list_layout entirely by _render_list
+            # - unlaid-out, not just hidden (see that method's own comment
+            # on why: avoids a worse phantom-window leak). set_locked_for_send
+            # below force-shows it again regardless, so without re-inserting
+            # it into the layout first, Qt renders it at a stale/unmanaged
+            # position - overlapping whatever row IS actually laid out
+            # there. Only ever needed for a selected row that fell out of
+            # the list this way; every already-laid-out row is a no-op here.
+            if selected and self.list_layout.indexOf(row) == -1:
+                self.list_layout.insertWidget(self.list_layout.count() - 1, row)
+            row.set_locked_for_send(selected)
 
         logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s) ===",
                self.filename, display_name, json.dumps(targets), start_print)
