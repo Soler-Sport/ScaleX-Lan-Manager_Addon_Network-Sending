@@ -217,6 +217,43 @@ class TestFetchWarehouseComponents:
         assert components == [{"id": "c1", "code": "X:Y", "name": "n"}]
         assert conn.request.call_args[0] == ("GET", "/api/warehouse")
 
+    def test_default_context_sends_no_context_header(self):
+        conn = _mock_conn(body=b'{"components": []}')
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.fetch_warehouse_components()
+        assert conn.request.call_args[1]["headers"] == {}
+
+    def test_orders_context_sends_header(self):
+        conn = _mock_conn(body=b'{"components": []}')
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.fetch_warehouse_components("orders")
+        assert conn.request.call_args[1]["headers"] == {"X-Warehouse-Context": "orders"}
+
+    def test_fetch_all_tags_each_component_with_its_context(self):
+        def fake(context="warehouse"):
+            return {"warehouse": [{"id": "w1", "name": "A"}], "orders": [{"id": "o1", "name": "Box(17,18)"}]}[context]
+        with patch("slm_chitu_send.fetch_warehouse_components", side_effect=fake):
+            comps = slm_chitu_send.fetch_all_warehouse_components()
+        assert comps == [{"id": "w1", "name": "A", "warehouseContext": "warehouse"},
+                         {"id": "o1", "name": "Box(17,18)", "warehouseContext": "orders"}]
+
+    def test_fetch_all_survives_orders_failure_but_not_main_failure(self):
+        def orders_down(context="warehouse"):
+            if context == "orders":
+                raise RuntimeError("HTTP 500")
+            return [{"id": "w1", "name": "A"}]
+        with patch("slm_chitu_send.fetch_warehouse_components", side_effect=orders_down):
+            assert [c["id"] for c in slm_chitu_send.fetch_all_warehouse_components()] == ["w1"]
+
+        def main_down(context="warehouse"):
+            raise RuntimeError("HTTP 500")
+        with patch("slm_chitu_send.fetch_warehouse_components", side_effect=main_down):
+            try:
+                slm_chitu_send.fetch_all_warehouse_components()
+                assert False, "expected RuntimeError"
+            except RuntimeError:
+                pass
+
     def test_missing_components_key_returns_empty_list(self):
         conn = _mock_conn(body=b'{"articles": []}')
         with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
@@ -248,6 +285,17 @@ class TestSaveCtbComposition:
             {"component_id": "comp-2", "quantity": 1},
         ]
         assert call_args[1]["headers"]["Content-Type"] == "application/json"
+
+    def test_orders_context_adds_header_default_does_not(self):
+        conn = _mock_conn(status=200)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.save_ctb_composition("Box x30.ctb", [("o1", 30)], context="orders")
+        assert conn.request.call_args[1]["headers"]["X-Warehouse-Context"] == "orders"
+
+        conn = _mock_conn(status=200)
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.save_ctb_composition("Box x30.ctb", [("w1", 30)])
+        assert "X-Warehouse-Context" not in conn.request.call_args[1]["headers"]
 
     def test_non_2xx_raises(self):
         conn = _mock_conn(status=400, body=b'{"error": "bad request"}')

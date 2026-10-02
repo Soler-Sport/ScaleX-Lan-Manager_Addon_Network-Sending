@@ -636,10 +636,21 @@ def fetch_printers():
 # C:\ChituHook\chitu_filelist_hook_pro.c's own header comment. That gives an
 # exact per-model list to match against warehouse component codes instead.
 # ---------------------------------------------------------------------------
-def fetch_warehouse_components():
+WAREHOUSE_CONTEXTS = ("warehouse", "orders")  # «Виртуальный склад» / «Склад заказов» - ScaleX's X-Warehouse-Context
+
+
+def fetch_warehouse_components(context="warehouse"):
+    """Components of one ScaleX warehouse context. 2026-10-02: ScaleX keeps
+    two separate warehouses («Виртуальный склад» = "warehouse", «Склад
+    заказов» = "orders", selected per request by the X-Warehouse-Context
+    header) with disjoint component sets - Box(17,18) lives only in
+    "orders", so reading just the default one left it permanently
+    unmatched. The header is only sent for non-default contexts, so the
+    default call is unchanged."""
     conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=10)
     try:
-        conn.request("GET", "/api/warehouse")
+        headers = {} if context == "warehouse" else {"X-Warehouse-Context": context}
+        conn.request("GET", "/api/warehouse", headers=headers)
         resp = conn.getresponse()
         body = resp.read()
         if resp.status != 200:
@@ -650,7 +661,26 @@ def fetch_warehouse_components():
         conn.close()
 
 
-def save_ctb_composition(file_name, component_quantities):
+def fetch_all_warehouse_components():
+    """Components of every ScaleX warehouse context, each copy tagged with
+    its own "warehouseContext" so a later save goes to the right one. The
+    main warehouse must succeed (raises like before); the orders one is
+    best-effort - if it fails the plate is still matched against the main
+    warehouse, with the failure logged."""
+    result = []
+    for context in WAREHOUSE_CONTEXTS:
+        try:
+            comps = fetch_warehouse_components(context)
+        except Exception as e:
+            if context == "warehouse":
+                raise
+            logmsg("=== COMPOSITION: failed to fetch %r warehouse components: %s ===", context, e)
+            continue
+        result.extend(dict(c, warehouseContext=context) for c in comps)
+    return result
+
+
+def save_ctb_composition(file_name, component_quantities, context="warehouse"):
     """PUT /api/warehouse/ctb-mappings - {file_name, component_quantities:
     [{component_id, quantity}]}. This REPLACES whatever composition ScaleX
     already has for this file name, so callers must only call this with a
@@ -666,8 +696,10 @@ def save_ctb_composition(file_name, component_quantities):
                 {"component_id": cid, "quantity": qty} for cid, qty in component_quantities
             ],
         }).encode("utf-8")
-        conn.request("PUT", "/api/warehouse/ctb-mappings", body=body,
-                     headers={"Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        if context != "warehouse":
+            headers["X-Warehouse-Context"] = context
+        conn.request("PUT", "/api/warehouse/ctb-mappings", body=body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
         if resp.status not in (200, 201, 202):
@@ -790,8 +822,12 @@ def _composition_item_label(component):
     name = component.get("name")
     code = component.get("code")
     if name and code and name != code:
-        return "%s (арт. %s)" % (name, code)
-    return name or code or component.get("id") or "?"
+        label = "%s (арт. %s)" % (name, code)
+    else:
+        label = name or code or component.get("id") or "?"
+    if component.get("warehouseContext") == "orders":
+        label += " [склад заказов]"
+    return label
 
 
 def suggest_composition_matches(unmatched_names, components, cutoff=0.85):
@@ -2184,7 +2220,7 @@ class PickerWindow(QMainWindow):
     def _start_fetch_composition(self):
         def worker():
             try:
-                components = fetch_warehouse_components()
+                components = fetch_all_warehouse_components()
                 self._composition_signal.emit(components, "")
             except Exception as e:
                 self._composition_signal.emit([], str(e))
@@ -2226,7 +2262,7 @@ class PickerWindow(QMainWindow):
             for n, cnt in counts.items():
                 item = n if cnt == 1 else "%s×%d" % (n, cnt)
                 if n in hints:
-                    item += " (похоже на: %s)" % " / ".join(hints[n])
+                    item += " (на складе есть похожие: %s)" % " / ".join(hints[n])
                 shown.append(item)
             parts.append("Без совпадения (%d): %s" % (len(self.composition_unmatched), ", ".join(shown)))
         self.composition_notice.setText("\n".join(parts))
@@ -2277,23 +2313,35 @@ class PickerWindow(QMainWindow):
         not at load time, so a last-second change of selection is honored."""
         if self.test_print_cb.isChecked():
             return  # test print: excluded from stock, nothing to record
-        counts = {}
+        # context -> {component id: quantity}. Components of the two ScaleX
+        # warehouses ("warehouse"/"orders") have disjoint ids and a mapping
+        # saved under the wrong context's header 404s, so each context's
+        # parts are saved in their own PUT (in practice a plate is all one
+        # context - orders holds only a handful of Box components).
+        by_context = {}
+
+        def add(component, qty):
+            ctx = component.get("warehouseContext") or "warehouse"
+            bucket = by_context.setdefault(ctx, {})
+            bucket[component["id"]] = bucket.get(component["id"], 0) + qty
+
         for c, qty in self.composition_matched:
-            counts[c["id"]] = counts.get(c["id"], 0) + qty
+            add(c, qty)
         for model_name, candidates, quantity in self.composition_ambiguous:
             combo = self.composition_choice_combos.get(model_name)
-            chosen = combo.currentData() if combo else candidates[0]
-            counts[chosen["id"]] = counts.get(chosen["id"], 0) + quantity
-        if not counts:
+            add(combo.currentData() if combo else candidates[0], quantity)
+        if not by_context:
             return
-        quantities = list(counts.items())
 
         def worker():
-            try:
-                save_ctb_composition(file_name, quantities)
-                logmsg("=== COMPOSITION: saved %d component(s) for %s ===", len(quantities), file_name)
-            except Exception as e:
-                logmsg("=== COMPOSITION: failed to save for %s: %s ===", file_name, e)
+            for ctx, counts in by_context.items():
+                quantities = list(counts.items())
+                try:
+                    save_ctb_composition(file_name, quantities, context=ctx)
+                    logmsg("=== COMPOSITION: saved %d component(s) for %s (%s) ===",
+                           len(quantities), file_name, ctx)
+                except Exception as e:
+                    logmsg("=== COMPOSITION: failed to save for %s (%s): %s ===", file_name, ctx, e)
         threading.Thread(target=worker, daemon=True).start()
 
     # -- filtering/rendering -------------------------------------------------
