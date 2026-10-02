@@ -2611,9 +2611,22 @@ class AppController(QObject):
     own docstring), or None (slicer_file_watcher()'s backstop path has no
     connection at all) - see PickerWindow.closeEvent."""
     file_captured = Signal(str, object)
+    # 2026-10-02 (user request): emitted the moment we ask CHITUBOX to save,
+    # with the slice's name - CHITUBOX then spends anywhere from a fraction
+    # of a second to 30+ s writing a 250-300 MB file before it answers
+    # (scales with size, see the log), and nothing on screen says the click
+    # registered meanwhile. The GUI thread shows a tray notice.
+    save_requested = Signal(str)
 
 
 controller = None  # created in main(), before any background thread starts
+
+
+def show_waiting_notice(tray, slice_label):
+    tray.showMessage(
+        "slm_chitu_send",
+        "Жду файл от CHITUBOX: %s\nБольшие файлы сохраняются до минуты - окно откроется само." % slice_label,
+        QSystemTrayIcon.Information, 8000)
 
 
 # "1a / Send over grid" from the project's icon design pass (2026-08-21) -
@@ -3136,6 +3149,7 @@ def handle_client(conn, addr):
                         request = json.dumps({"MsgType": "SaveFile", "FilePath": target.replace("\\", "/")})
                         chandle.send((request + "\n").encode("utf-8"))
                         logmsg("=== REQUESTED SaveFile: %s ===", target)
+                        controller.save_requested.emit(slice_label)
                     else:
                         logmsg("  -> Visible:true within cooldown (%.1fs ago), not requesting again",
                                now - last_request_ts)
@@ -3398,6 +3412,7 @@ def main():
     controller.file_captured.connect(open_picker_window, Qt.QueuedConnection)
 
     tray, tray_menu, tray_actions = build_tray_icon(app)  # noqa: F841 - refs kept alive deliberately
+    controller.save_requested.connect(lambda label: show_waiting_notice(tray, label), Qt.QueuedConnection)
 
     threading.Thread(target=slicer_file_watcher, daemon=True).start()
     threading.Thread(target=_pending_dir_watcher, daemon=True).start()
