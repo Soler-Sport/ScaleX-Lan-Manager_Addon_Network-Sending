@@ -741,6 +741,15 @@ def match_composition_components(model_names, components):
     happen to use code-style file names."""
     by_key = {}
     for c in components:
+        # 2026-10-02: /api/warehouse also returns soft-deleted components
+        # (deletedAt set - 248 of 1867 live), and PUT ctb-mappings answers
+        # 404 "Component not found" for them. The WW-35029 wheel family
+        # had old deleted records (code WW-35028:*) sharing names with
+        # their live replacements, so every plate was flagged "ambiguous"
+        # with the deleted record first in the picker - the save then
+        # 404'd silently (log only) and ScaleX showed "Состав не назначен".
+        if c.get("deletedAt"):
+            continue
         for key_field in ("code", "name"):
             key = _normalize_composition_key(c.get(key_field) or "")
             if not key:

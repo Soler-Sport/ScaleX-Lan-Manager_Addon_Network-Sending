@@ -133,6 +133,32 @@ class TestMatchCompositionComponents:
         assert quantity == 2
         assert len(candidates) == 2
 
+    def test_soft_deleted_duplicate_is_ignored_not_ambiguous(self):
+        # Real case (2026-10-02, WW-35029 wheels): an old deleted record
+        # shares its name with the live replacement. PUT ctb-mappings 404s
+        # on deleted ids, so only the live one may ever be matched.
+        components = [
+            {"id": "old", "code": "WW-35028:S", "name": "WW-35029_S",
+             "deletedAt": "2026-09-11T10:16:18+00:00"},
+            {"id": "live", "code": None, "name": "WW-35029_S", "deletedAt": None},
+        ]
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+            ["WW-35029_S.stl"], components)
+
+        assert matched == [(components[1], 1)]
+        assert ambiguous == []
+        assert unmatched == []
+
+    def test_only_deleted_component_matching_goes_to_unmatched(self):
+        components = [{"id": "old", "code": None, "name": "Gone Part",
+                       "deletedAt": "2026-09-11T10:16:18+00:00"}]
+        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+            ["Gone Part.stl"], components)
+
+        assert matched == []
+        assert ambiguous == []
+        assert unmatched == ["Gone Part.stl"]
+
     def test_ambiguous_and_unambiguous_matches_stay_independent(self):
         components = self.COMPONENTS + self.SAME_NAME_COMPONENTS
         matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
