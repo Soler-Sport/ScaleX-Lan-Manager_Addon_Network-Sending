@@ -55,6 +55,19 @@ class TestForwardToScalex:
         headers = conn.request.call_args[1]["headers"]
         assert headers["X-Start-Print"] == "false"
 
+    def test_test_print_sets_header_only_when_true(self, tmp_path):
+        f = tmp_path / "test.ctb"
+        f.write_bytes(b"x")
+        conn = _mock_conn()
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.forward_to_scalex(str(f), "p1", test_print=True)
+        assert conn.request.call_args[1]["headers"]["X-Test-Print"] == "true"
+
+        conn = _mock_conn()
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.forward_to_scalex(str(f), "p1")
+        assert "X-Test-Print" not in conn.request.call_args[1]["headers"]
+
     def test_display_name_used_over_file_basename(self, tmp_path):
         f = tmp_path / "internal_name_abc123.ctb"
         f.write_bytes(b"x")
@@ -78,6 +91,17 @@ class TestPatchAndUploadSingle:
         sent = json.loads(call_args[1]["body"])
         assert sent == {"printerId": "printer-1", "draftId": "draft-1",
                          "patch": {"normalExposure": 2.8}, "autoStart": True}
+
+    def test_test_print_adds_field_only_when_true(self):
+        conn = _mock_conn()
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.patch_and_upload_single("d1", "p1", {}, False, test_print=True)
+        assert json.loads(conn.request.call_args[1]["body"])["testPrint"] is True
+
+        conn = _mock_conn()
+        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+            slm_chitu_send.patch_and_upload_single("d1", "p1", {}, False)
+        assert "testPrint" not in json.loads(conn.request.call_args[1]["body"])
 
     def test_auto_start_coerced_to_bool(self):
         conn = _mock_conn()

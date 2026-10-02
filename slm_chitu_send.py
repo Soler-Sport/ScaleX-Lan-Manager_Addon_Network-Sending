@@ -877,22 +877,28 @@ def _post_raw_file(path, body_bytes, extra_headers):
         conn.close()
 
 
-def forward_to_scalex(file_path, printer_id, display_name=None, start_print=None):
+def forward_to_scalex(file_path, printer_id, display_name=None, start_print=None, test_print=False):
     """Single-printer upload, no CTB patching: POST /api/printers/{id}/files.
     Fast path - ScaleX just streams the file straight to the printer, no
     temporary copy/rewrite involved (that only happens via the CTB
     draft/patch-and-upload flow below, and only when there's an actual
     patch to apply). start_print=None keeps the old SCALEX_START_PRINT
-    default; pass True/False to override per call."""
+    default; pass True/False to override per call. test_print marks the
+    print as «Тестовая - без учёта склада» (ScaleX's own X-Test-Print
+    header, same one its upload dialog sets) - only sent when true, so a
+    normal send's request is unchanged."""
     if start_print is None:
         start_print = SCALEX_START_PRINT
     filename = display_name or os.path.basename(file_path)
     with open(file_path, "rb") as f:
         data = f.read()
+    headers = {"X-Start-Print": "true" if start_print else "false"}
+    if test_print:
+        headers["X-Test-Print"] = "true"
     status, resp_body = _post_raw_file(
         "/api/printers/%s/files" % printer_id,
         (urllib.parse.quote(filename), data),
-        {"X-Start-Print": "true" if start_print else "false"},
+        headers,
     )
     logmsg("=== FORWARD TO SCALEX (single, unpatched): %s -> HTTP %d: %s ===",
            filename, status, resp_body[:500].decode("utf-8", "replace"))
@@ -982,18 +988,22 @@ def build_recommendation_patch(printer):
     return patch
 
 
-def patch_and_upload_single(draft_id, printer_id, patch, auto_start):
+def patch_and_upload_single(draft_id, printer_id, patch, auto_start, test_print=False):
     """POST /api/ctb/patch-and-upload {printerId, draftId, patch, autoStart}.
     Single-printer only - it's the only ScaleX endpoint that actually starts
     a print (X-Start-Print/autoStart isn't honoured by the bulk endpoints at
     all, confirmed in app.js), so a multi-printer "start print" send loops
-    this call once per target printer."""
+    this call once per target printer. testPrint (ScaleX's own field, see
+    forward_to_scalex) is only included when true."""
     conn = http.client.HTTPConnection(SCALEX_HOST, SCALEX_PORT, timeout=1800)
     try:
-        body = json.dumps({
+        payload = {
             "printerId": printer_id, "draftId": draft_id,
             "patch": patch, "autoStart": bool(auto_start),
-        }).encode("utf-8")
+        }
+        if test_print:
+            payload["testPrint"] = True
+        body = json.dumps(payload).encode("utf-8")
         conn.request("POST", "/api/ctb/patch-and-upload", body=body,
                       headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
         resp = conn.getresponse()
@@ -1109,8 +1119,11 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
         progress_cb(True, True, None, "Тайм-аут ожидания статуса", {})
 
 
-def send_in_background(file_path, targets, display_name=None, start_print=False, report_cb=None):
+def send_in_background(file_path, targets, display_name=None, start_print=False, report_cb=None,
+                       test_print=False):
     """targets: list of {"printerId": id, "applyRecommendations": bool}.
+    test_print: mark every upload as a test print («без учёта склада») -
+    see forward_to_scalex.
     display_name: filename to present to ScaleX (defaults to the file's own
     name on disk) - lets the picker page rename the file before sending,
     same idea as ChituManager's own editable filename field.
@@ -1314,14 +1327,16 @@ def send_in_background(file_path, targets, display_name=None, start_print=False,
             patch = build_recommendation_patch(printer) if (wants_patch and is_ctb_patchable) else {}
             try:
                 if patch:
-                    status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, effective_start_print)
+                    status, resp_body = patch_and_upload_single(_get_draft_id(), pid, patch, effective_start_print,
+                                                                test_print=test_print)
                     logmsg("=== PATCH+UPLOAD (startPrint=%s, deferred=%s) -> %s: HTTP %d: %s ===",
                            effective_start_print, needs_deferred_start, pid, status, resp_body[:400].decode("utf-8", "replace"))
                 else:
                     # Timings already fine for this printer (or no
                     # recommendations to apply) - skip the rewrite, send
                     # the file as-is.
-                    status, resp_body = forward_to_scalex(file_path, pid, display_name=name, start_print=effective_start_print)
+                    status, resp_body = forward_to_scalex(file_path, pid, display_name=name,
+                                                          start_print=effective_start_print, test_print=test_print)
                 if 200 <= status < 300:
                     try:
                         initial_json = json.loads(resp_body.decode("utf-8", "replace"))
@@ -1921,6 +1936,7 @@ class PickerWindow(QMainWindow):
         self._loaded_once = False
         self._last_display_name = None  # set by _on_send_clicked, reused by a single-row retry
         self._last_start_print = False
+        self._last_test_print = False
 
         self.setWindowTitle("Network sending — %s" % filename)
         self.resize(760, 820)
@@ -2010,6 +2026,15 @@ class PickerWindow(QMainWindow):
         self.composition_ambiguous_layout.setSpacing(4)
         self.composition_ambiguous_widget.setVisible(False)
         form.addWidget(self.composition_ambiguous_widget)
+
+        # 2026-10-02 (user request): ScaleX's own «Тестовая - без учёта
+        # склада» flag (X-Test-Print / testPrint) - the print is excluded
+        # from stock accounting, so no composition is saved for it either
+        # (see _save_composition_in_background).
+        self.test_print_cb = QCheckBox("Тестовая печать — без учёта склада (состав не сохраняется)")
+        self.test_print_cb.toggled.connect(
+            lambda checked: self.composition_ambiguous_widget.setEnabled(not checked))
+        form.addWidget(self.test_print_cb)
 
         filters_row = QHBoxLayout()
         self.online_only_cb = QCheckBox("Показывать включённые")
@@ -2250,6 +2275,8 @@ class PickerWindow(QMainWindow):
         here from whatever article is currently selected in each combo box
         built by _rebuild_composition_ambiguous_rows() - read at send time,
         not at load time, so a last-second change of selection is honored."""
+        if self.test_print_cb.isChecked():
+            return  # test print: excluded from stock, nothing to record
         counts = {}
         for c, qty in self.composition_matched:
             counts[c["id"]] = counts.get(c["id"], 0) + qty
@@ -2346,6 +2373,9 @@ class PickerWindow(QMainWindow):
             display_name += src_ext
         self._last_display_name = display_name  # reused by a later single-row retry
         self._last_start_print = start_print
+        test_print = self.test_print_cb.isChecked()
+        self._last_test_print = test_print
+        self.test_print_cb.setEnabled(False)  # locked for the send, like the other inputs
         self._save_composition_in_background(display_name)
 
         self.sending = True
@@ -2384,7 +2414,7 @@ class PickerWindow(QMainWindow):
             self._progress_signal.emit(phase, percent, targets_out)
 
         send_in_background(self.file_path, targets, display_name=display_name,
-                            start_print=start_print, report_cb=report_cb)
+                            start_print=start_print, report_cb=report_cb, test_print=test_print)
 
     def _on_progress(self, phase, percent, targets_out):
         if not targets_out:
@@ -2450,7 +2480,8 @@ class PickerWindow(QMainWindow):
             self._retry_signal.emit(targets_out)
 
         send_in_background(self.file_path, [target], display_name=display_name,
-                            start_print=start_print, report_cb=report_cb)
+                            start_print=start_print, report_cb=report_cb,
+                            test_print=self._last_test_print)
 
     def _on_retry_progress(self, targets_out):
         for t in targets_out:

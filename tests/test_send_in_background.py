@@ -93,6 +93,33 @@ def test_prepared_printer_starts_immediately_no_recommendations(tmp_path):
     assert not any(c[1] == "/api/ctb/patch-and-upload" for c in factory.calls)
 
 
+def test_test_print_flag_reaches_the_upload_request(tmp_path):
+    f = tmp_path / "test.ctb"
+    f.write_bytes(b"fake ctb data")
+    printer = {"id": "p1", "displayName": "Printer 1", "operatorPrepared": True,
+               "status": {"remainingMemory": 999999999}}
+    responses = {
+        "/files": (202, {"uploadId": "up-1", "lastUploadedPath": "/local/test.ctb"}),
+        "/api/uploads/up-1": (200, {"done": True, "success": True, "percent": 100.0, "state": "upload_done"}),
+    }
+    factory = _fake_connection_factory(responses)
+    done_event = threading.Event()
+
+    def report_cb(phase, percent, targets_out):
+        if phase in ("done", "error"):
+            done_event.set()
+
+    with patch("slm_chitu_send.fetch_printers", return_value=[printer]), \
+         patch("slm_chitu_send.http.client.HTTPConnection", side_effect=factory):
+        slm_chitu_send.send_in_background(
+            str(f), [{"printerId": "p1", "applyRecommendations": False}],
+            display_name="test.ctb", start_print=False, report_cb=report_cb, test_print=True)
+        _wait_for_terminal([], done_event)
+
+    upload_headers = [h for (_, path, _, h) in factory.calls if path.endswith("/files")]
+    assert upload_headers and upload_headers[0]["X-Test-Print"] == "true"
+
+
 def test_unprepared_printer_with_recommendations_defers_start(tmp_path):
     """The exact real scenario from 2026-08-27: a printer with
     recommendations selected (patched-upload path) that ISN'T
