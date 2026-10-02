@@ -169,6 +169,42 @@ class TestMatchCompositionComponents:
         assert unmatched == []
 
 
+class TestSuggestCompositionMatches:
+    COMPONENTS = [
+        {"id": "a", "code": None, "name": "WM-35042_L_A", "deletedAt": None},
+        {"id": "b", "code": None, "name": "WM-35042_L_B", "deletedAt": None},
+        {"id": "gone", "code": None, "name": "WW-35042_L_C", "deletedAt": "2026-09-11T10:00:00+00:00"},
+    ]
+
+    def test_suggests_near_miss_prefix_typo(self):
+        hints = slm_chitu_send.suggest_composition_matches(["WW-35042_L_A.stl"], self.COMPONENTS)
+
+        assert hints == {"WW-35042_L_A.stl": ["WM-35042_L_A"]}
+
+    def test_lists_every_close_candidate_when_edit_distance_cannot_decide(self):
+        # One character from BOTH WM-35042_L_A and WW-35032_L_A - must not
+        # silently pick one.
+        components = self.COMPONENTS + [
+            {"id": "c", "code": None, "name": "WW-35032_L_A", "deletedAt": None}]
+        hints = slm_chitu_send.suggest_composition_matches(["WW-35042_L_A.stl"], components)
+
+        assert sorted(hints["WW-35042_L_A.stl"]) == ["WM-35042_L_A", "WW-35032_L_A"]
+
+    def test_no_suggestion_for_unrelated_name(self):
+        assert slm_chitu_send.suggest_composition_matches(["Box(17,18).stl"], self.COMPONENTS) == {}
+
+    def test_deleted_components_are_never_suggested(self):
+        hints = slm_chitu_send.suggest_composition_matches(["WW-35042_L_C.stl"], self.COMPONENTS)
+
+        assert "WW-35042_L_C" not in [label for labels in hints.values() for label in labels]
+
+    def test_repeated_names_are_deduplicated(self):
+        hints = slm_chitu_send.suggest_composition_matches(
+            ["WW-35042_L_A.stl"] * 5, self.COMPONENTS)
+
+        assert list(hints) == ["WW-35042_L_A.stl"]
+
+
 class TestFetchWarehouseComponents:
     def test_gets_components_from_warehouse_payload(self):
         conn = _mock_conn(body=json.dumps({

@@ -794,6 +794,48 @@ def _composition_item_label(component):
     return name or code or component.get("id") or "?"
 
 
+def suggest_composition_matches(unmatched_names, components, cutoff=0.85):
+    """Display-only "did you mean" for model names that matched no live
+    warehouse component: {model_name: component label}. Never used to
+    assign anything - which part gets decremented from stock must stay an
+    operator decision. Live case (2026-10-02): plates named WW-35042_L_A
+    while the warehouse holds WM-35042_L_A (WW vs WM) - exact matching
+    rightly refuses that, but the operator should be told why."""
+    import difflib
+    labels = {}
+    for c in components:
+        if c.get("deletedAt"):
+            continue
+        for field in ("code", "name"):
+            label = c.get(field)
+            key = _normalize_composition_key(label or "")
+            if key:
+                labels.setdefault(key, label)
+    keys = list(labels)
+
+    def tail(key):
+        return re.sub(r"^[a-z]+-?", "", key)
+
+    by_tail = {}
+    for k in keys:
+        by_tail.setdefault(tail(k), []).append(k)
+
+    out = {}
+    for name in dict.fromkeys(unmatched_names):
+        stem = _normalize_composition_key(os.path.splitext(name)[0])
+        # Same number/suffix, different letter prefix first (WW-35042_L_A
+        # vs WM-35042_L_A - the typical typo), then plain closeness. Up to
+        # 3, not 1: WW-35032_L_A is just as close by edit distance but a
+        # different real part, so one silent pick could mislead - show the
+        # candidates and let the operator judge.
+        same_tail = [k for k in by_tail.get(tail(stem), []) if k != stem] if len(tail(stem)) >= 5 else []
+        close = same_tail + [k for k in difflib.get_close_matches(stem, keys, n=3, cutoff=cutoff)
+                             if k not in same_tail]
+        if close:
+            out[name] = [labels[k] for k in close[:3]]
+    return out
+
+
 def _progress_from_status(status):
     """Best-effort (percent, message) out of either ScaleX status shape:
     /api/uploads/{id} (flat percent/stage) or /api/bulk-uploads/{id}
@@ -2151,8 +2193,17 @@ class PickerWindow(QMainWindow):
             parts.append("Несколько артикулов с одним названием (%d) - выберите целевой артикул ниже:" %
                           len(self.composition_ambiguous))
         if self.composition_unmatched:
-            parts.append("Без совпадения (%d): %s" % (
-                len(self.composition_unmatched), ", ".join(self.composition_unmatched)))
+            hints = suggest_composition_matches(self.composition_unmatched, components)
+            counts = {}
+            for n in self.composition_unmatched:
+                counts[n] = counts.get(n, 0) + 1
+            shown = []
+            for n, cnt in counts.items():
+                item = n if cnt == 1 else "%s×%d" % (n, cnt)
+                if n in hints:
+                    item += " (похоже на: %s)" % " / ".join(hints[n])
+                shown.append(item)
+            parts.append("Без совпадения (%d): %s" % (len(self.composition_unmatched), ", ".join(shown)))
         self.composition_notice.setText("\n".join(parts))
         self.composition_notice.setVisible(True)
 
