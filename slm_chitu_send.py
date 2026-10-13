@@ -2959,9 +2959,11 @@ def _copy_chitu_hook_sidecar(send_path, dest):
     _capture_and_emit() caller. A missing sidecar (hook disabled/not
     installed, or an older capture from before this feature) is the normal
     case, not an error."""
+    global _hook_sidecar_seen
     src_json = os.path.splitext(send_path)[0] + ".json"
     if not os.path.isfile(src_json):
         return
+    _hook_sidecar_seen = True
     dest_json = os.path.splitext(dest)[0] + ".json"
     try:
         shutil.copy2(src_json, dest_json)
@@ -3059,11 +3061,72 @@ def _finish_goo_v5_capture_body(candidate, chandle):
                "(missing, or caught mid-rewrite) ===", candidate)
 
 
+# 2026-10-13: CHITUBOX silently drops ~15% of our SaveFile requests - never
+# even calls saveSliceFile (goo_hook writes the sidecar JSON at the START of
+# that call, and it's absent for every dropped request), then answers only
+# when the operator saves by hand. No logged state predicts it (open
+# pickers, last Visible flag, repeated slice, fresh SlicerInfo and prior
+# close notices were all ruled out), but dropped requests were slightly more
+# common when the request followed our LoadWindow reply within the same
+# millisecond (20% at 0 ms, 12% at 1 ms, 0 of 3 at 2+ ms) - so the request
+# now goes out a beat after the reply, and if CHITUBOX still doesn't start
+# saving it is re-sent (see _request_save_with_retry).
+SAVE_REQUEST_DELAY_SEC = 0.25
+SAVE_ACCEPT_WAIT_SEC = 3.0
+SAVE_MAX_RETRIES = 2
+_hook_sidecar_seen = False  # set once any save produced goo_hook's sidecar JSON - proof the "started saving" signal works
+
+
+def _request_save_with_retry(chandle, state, slice_label, ext, retries_left=SAVE_MAX_RETRIES):
+    """Runs on its own thread (handle_client's recv loop must stay free).
+    Sends one SaveFile request, then watches for CHITUBOX actually starting
+    the save: goo_hook writes <target>.json the moment saveSliceFile begins,
+    and the target file itself appears once data is flowing. Neither within
+    SAVE_ACCEPT_WAIT_SEC means the request was dropped - re-send with a
+    fresh name. Retries only once the hook has been seen working this run
+    (_hook_sidecar_seen): without that signal "dropped" can't be told apart
+    from "slow", and a blind re-send could double-save a big file.
+    state["awaiting"] is the shared "which request is the reply for" - a
+    reply (cleared) or a newer request (replaced) ends this watchdog."""
+    global _hook_sidecar_seen
+    try:
+        time.sleep(SAVE_REQUEST_DELAY_SEC)
+        target = os.path.join(PENDING_DIR, "%s_%s%s" % (slice_label, uuid.uuid4().hex[:8], ext))
+        state["awaiting"] = target
+        request = json.dumps({"MsgType": "SaveFile", "FilePath": target.replace("\\", "/")})
+        chandle.send((request + "\n").encode("utf-8"))
+        logmsg("=== REQUESTED SaveFile: %s ===", target)
+        controller.save_requested.emit(slice_label)
+
+        sidecar = os.path.splitext(target)[0] + ".json"
+        deadline = time.monotonic() + SAVE_ACCEPT_WAIT_SEC
+        while time.monotonic() < deadline:
+            if state["awaiting"] != target:
+                return
+            if os.path.exists(sidecar):
+                _hook_sidecar_seen = True
+                return
+            if os.path.exists(target):
+                return
+            time.sleep(0.2)
+        if state["awaiting"] != target or not _hook_sidecar_seen:
+            return
+        if retries_left <= 0:
+            logmsg("=== CHITUBOX ignored the SaveFile request and %d re-sends for %s ===",
+                   SAVE_MAX_RETRIES, slice_label)
+            return
+        logmsg("=== CHITUBOX didn't start saving %s within %.0fs - re-sending (%d left) ===",
+               os.path.basename(target), SAVE_ACCEPT_WAIT_SEC, retries_left)
+        _request_save_with_retry(chandle, state, slice_label, ext, retries_left - 1)
+    except Exception as e:
+        logmsg("=== _request_save_with_retry FAILED: %s ===", e)
+
+
 def handle_client(conn, addr):
     logmsg("=== CLIENT CONNECTED from %s:%d ===", addr[0], addr[1])
     chandle = _ChituboxConn(conn)  # 2026-09-08 (code-review fix, findings #4/#5) - see its own docstring
     last_request_ts = 0.0
-    awaiting_path = None
+    state = {"awaiting": None}  # path of the SaveFile request a reply would answer - shared with _request_save_with_retry's thread
     slice_label = "network_send"
     printer_type = ""  # 2026-09-08: from CHITUBOX's own "PrinterType" JSON
     # field (same WindowProperty payload as SliceFileName) - gates whether
@@ -3095,7 +3158,8 @@ def handle_client(conn, addr):
                 printer_type = pt
 
             # The reply to our own SaveFile request: {"MsgType":"SaveFile","Data":{"SavePath":...}}
-            if '"MsgType": "SaveFile"' in text and awaiting_path:
+            if '"MsgType": "SaveFile"' in text and state["awaiting"]:
+                awaiting_path = state["awaiting"]
                 save_path = extract_field(text, '"SavePath": "')
                 logmsg("=== SaveFile reply: SavePath=%s (awaiting=%s) ===", save_path, awaiting_path)
                 candidate = save_path or awaiting_path
@@ -3136,7 +3200,7 @@ def handle_client(conn, addr):
                     _capture_and_emit(candidate, chandle)
                 else:
                     logmsg("=== SaveFile reply but file not found at %s ===", candidate)
-                awaiting_path = None
+                state["awaiting"] = None
 
             if '"MsgType": "LoadWindow"' in text and '"WinType"' in text:
                 ok = chandle.send(LOADWINDOW_REPLY)
@@ -3192,12 +3256,8 @@ def handle_client(conn, addr):
                             logmsg("  -> WARNING: no PrinterType seen yet on this connection - "
                                    "defaulting to .ctb (would be wrong for ELEGOO Jupiter 2)")
                         ext = ".goo" if is_jupiter2 else ".ctb"
-                        target = os.path.join(PENDING_DIR, "%s_%s%s" % (slice_label, uuid.uuid4().hex[:8], ext))
-                        awaiting_path = target
-                        request = json.dumps({"MsgType": "SaveFile", "FilePath": target.replace("\\", "/")})
-                        chandle.send((request + "\n").encode("utf-8"))
-                        logmsg("=== REQUESTED SaveFile: %s ===", target)
-                        controller.save_requested.emit(slice_label)
+                        threading.Thread(target=_request_save_with_retry,
+                                         args=(chandle, state, slice_label, ext), daemon=True).start()
                     else:
                         logmsg("  -> Visible:true within cooldown (%.1fs ago), not requesting again",
                                now - last_request_ts)
