@@ -2859,6 +2859,16 @@ PENDING_ORPHAN_GRACE_SEC = 120  # deliberately generous - real jobs finish
 # variance, not tightly tuned.
 
 
+_SECRET_FIELD_RE = re.compile(r'("(?:password|cookie)"\s*:\s*)"(?:[^"\\]|\\.)*(?:"|$)', re.IGNORECASE)
+
+
+def _redact_secrets(text):
+    """CHITUBOX's Init message carries the account's Password (plain text)
+    and Cookie - found sitting in slm_chitu_send.log 2026-10-13. Everything
+    that logs a raw CHITUBOX message goes through this first."""
+    return _SECRET_FIELD_RE.sub(r'\1"***"', text)
+
+
 class _ChituboxConn:
     """2026-09-08 (code-review fix, findings #4/#5): thread-safe wrapper
     around one CHITUBOX TCP connection. Before this, handle_client()'s own
@@ -3071,13 +3081,23 @@ def _finish_goo_v5_capture_body(candidate, chandle):
 # millisecond (20% at 0 ms, 12% at 1 ms, 0 of 3 at 2+ ms) - so the request
 # now goes out a beat after the reply, and if CHITUBOX still doesn't start
 # saving it is re-sent (see _request_save_with_retry).
-SAVE_REQUEST_DELAY_SEC = 0.25
+# Capture of the STOCK ChituManager (tools/chitu_loopback_sniffer.py,
+# 2026-10-13) showed it sends the byte-identical {"FilePath":..,"MsgType":
+# "SaveFile"} request, but never sooner than 2.6 s after the click (the
+# operator is still choosing printers), answers each LoadWindow ping 10-30 ms
+# later, and gets exactly one ping per click - while episodes where our
+# requests were ignored show bursts of repeated pings. So: request no sooner
+# than SAVE_REQUEST_DELAY_SEC after the click, answer pings after
+# LOADWINDOW_REPLY_DELAY_SEC.
+SAVE_REQUEST_DELAY_SEC = 2.0
+LOADWINDOW_REPLY_DELAY_SEC = 0.02
 SAVE_ACCEPT_WAIT_SEC = 3.0
+SAVE_WATCH_POLL_SEC = 0.2
 SAVE_MAX_RETRIES = 2
 _hook_sidecar_seen = False  # set once any save produced goo_hook's sidecar JSON - proof the "started saving" signal works
 
 
-def _request_save_with_retry(chandle, state, slice_label, ext, retries_left=SAVE_MAX_RETRIES):
+def _request_save_with_retry(chandle, state, slice_label, ext, retries_left=None, replaces=None):
     """Runs on its own thread (handle_client's recv loop must stay free).
     Sends one SaveFile request, then watches for CHITUBOX actually starting
     the save: goo_hook writes <target>.json the moment saveSliceFile begins,
@@ -3086,17 +3106,31 @@ def _request_save_with_retry(chandle, state, slice_label, ext, retries_left=SAVE
     fresh name. Retries only once the hook has been seen working this run
     (_hook_sidecar_seen): without that signal "dropped" can't be told apart
     from "slow", and a blind re-send could double-save a big file.
-    state["awaiting"] is the shared "which request is the reply for" - a
-    reply (cleared) or a newer request (replaced) ends this watchdog."""
+    state["awaiting"] (guarded by state["lock"]) is the shared "which
+    request is the reply for": a reply clears it only if it still names this
+    request, and a re-send (replaces=<previous target>) only goes out if it
+    still does - so a newer click or a late reply during the delay/sleep
+    can't be clobbered (found in review 2026-10-13)."""
     global _hook_sidecar_seen
+    if retries_left is None:
+        retries_left = SAVE_MAX_RETRIES
     try:
+        if replaces is None and controller is not None:
+            controller.save_requested.emit(slice_label)  # immediate "click registered" feedback, once per click
         time.sleep(SAVE_REQUEST_DELAY_SEC)
         target = os.path.join(PENDING_DIR, "%s_%s%s" % (slice_label, uuid.uuid4().hex[:8], ext))
-        state["awaiting"] = target
+        with state["lock"]:
+            if replaces is not None and state["awaiting"] != replaces:
+                return  # answered, or superseded by a newer click, while we waited
+            state["awaiting"] = target
         request = json.dumps({"MsgType": "SaveFile", "FilePath": target.replace("\\", "/")})
-        chandle.send((request + "\n").encode("utf-8"))
+        if not chandle.send((request + "\n").encode("utf-8")):
+            logmsg("=== SaveFile request NOT sent (connection closed) for %s ===", slice_label)
+            with state["lock"]:
+                if state["awaiting"] == target:
+                    state["awaiting"] = None
+            return
         logmsg("=== REQUESTED SaveFile: %s ===", target)
-        controller.save_requested.emit(slice_label)
 
         sidecar = os.path.splitext(target)[0] + ".json"
         deadline = time.monotonic() + SAVE_ACCEPT_WAIT_SEC
@@ -3108,7 +3142,7 @@ def _request_save_with_retry(chandle, state, slice_label, ext, retries_left=SAVE
                 return
             if os.path.exists(target):
                 return
-            time.sleep(0.2)
+            time.sleep(SAVE_WATCH_POLL_SEC)
         if state["awaiting"] != target or not _hook_sidecar_seen:
             return
         if retries_left <= 0:
@@ -3117,7 +3151,7 @@ def _request_save_with_retry(chandle, state, slice_label, ext, retries_left=SAVE
             return
         logmsg("=== CHITUBOX didn't start saving %s within %.0fs - re-sending (%d left) ===",
                os.path.basename(target), SAVE_ACCEPT_WAIT_SEC, retries_left)
-        _request_save_with_retry(chandle, state, slice_label, ext, retries_left - 1)
+        _request_save_with_retry(chandle, state, slice_label, ext, retries_left - 1, replaces=target)
     except Exception as e:
         logmsg("=== _request_save_with_retry FAILED: %s ===", e)
 
@@ -3126,7 +3160,7 @@ def handle_client(conn, addr):
     logmsg("=== CLIENT CONNECTED from %s:%d ===", addr[0], addr[1])
     chandle = _ChituboxConn(conn)  # 2026-09-08 (code-review fix, findings #4/#5) - see its own docstring
     last_request_ts = 0.0
-    state = {"awaiting": None}  # path of the SaveFile request a reply would answer - shared with _request_save_with_retry's thread
+    state = {"awaiting": None, "lock": threading.Lock()}  # path of the SaveFile request a reply would answer - shared with _request_save_with_retry's thread
     slice_label = "network_send"
     printer_type = ""  # 2026-09-08: from CHITUBOX's own "PrinterType" JSON
     # field (same WindowProperty payload as SliceFileName) - gates whether
@@ -3147,7 +3181,7 @@ def handle_client(conn, addr):
                 text = chunk.decode("utf-8", "replace")
             except Exception:
                 text = ""
-            logmsg("RECV(%d): %s", len(chunk), text[:800])
+            logmsg("RECV(%d): %s", len(chunk), _redact_secrets(text)[:800])
 
             label = extract_field(text, '"SliceFileName": "')
             if label:
@@ -3200,9 +3234,12 @@ def handle_client(conn, addr):
                     _capture_and_emit(candidate, chandle)
                 else:
                     logmsg("=== SaveFile reply but file not found at %s ===", candidate)
-                state["awaiting"] = None
+                with state["lock"]:
+                    if state["awaiting"] == awaiting_path:  # a newer request may have replaced it meanwhile
+                        state["awaiting"] = None
 
             if '"MsgType": "LoadWindow"' in text and '"WinType"' in text:
+                time.sleep(LOADWINDOW_REPLY_DELAY_SEC)  # the stock manager answers 10-30 ms after the ping
                 ok = chandle.send(LOADWINDOW_REPLY)
                 logmsg("%s (%d bytes) LoadWindow reply", "SENT" if ok else "SEND FAILED", len(LOADWINDOW_REPLY))
 

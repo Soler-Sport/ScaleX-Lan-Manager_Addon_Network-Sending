@@ -12,6 +12,27 @@ from unittest.mock import MagicMock
 import slm_chitu_send
 
 
+class TestRedactSecrets:
+    INIT = ('{"Data": {"SoftwareInfo": {"Account": "user@example.com", "Cookie": "abc=1; x=\\"q\\"", '
+            '"Password": "hunter2-pa\\"ss", "Theme": 0}}, "MsgType": "Init"}')
+
+    def test_password_and_cookie_values_are_masked(self):
+        out = slm_chitu_send._redact_secrets(self.INIT)
+
+        assert "hunter2" not in out and "abc=1" not in out
+        assert '"Password": "***"' in out and '"Cookie": "***"' in out
+
+    def test_case_insensitive_and_value_cut_off_by_the_chunk_end(self):
+        out = slm_chitu_send._redact_secrets('{"password": "hunter2-and-more')
+
+        assert "hunter2" not in out and out.endswith('"***"')
+
+    def test_other_fields_and_null_cookie_are_untouched(self):
+        text = '{"Account": "user@example.com", "Cookie": null, "MsgType": "Init"}'
+
+        assert slm_chitu_send._redact_secrets(text) == text
+
+
 class TestChituboxConn:
     def test_send_delegates_to_underlying_socket(self):
         raw = MagicMock()
