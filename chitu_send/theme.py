@@ -109,6 +109,11 @@ QScrollArea { border: none; background: transparent; }
 #retryBtn { background: transparent; color: %(red)s; border: 1px solid %(red)s;
     border-radius: 6px; padding: 2px 9px; font-size: 10.5px; font-weight: 600; }
 #retryBtn:hover { background: rgba(255, 126, 120, .12); }
+QTabWidget::pane { border: none; }
+QTabBar::tab { background: %(panel2)s; color: %(dim)s; border: 1px solid %(line)s; border-bottom: none;
+    border-top-left-radius: 8px; border-top-right-radius: 8px; padding: 7px 12px; margin-right: 2px; max-width: 210px; }
+QTabBar::tab:selected { background: %(panel)s; color: %(text)s; border-color: rgba(232, 255, 101, .65); }
+QTabBar::tab:hover { color: %(text)s; }
 QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 5px;
     max-height: 8px; min-height: 8px; text-align: center; color: transparent; }
 QProgressBar::chunk { background: %(accent)s; border-radius: 5px; }

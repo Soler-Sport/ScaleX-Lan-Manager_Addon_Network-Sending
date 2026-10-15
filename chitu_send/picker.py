@@ -3,7 +3,7 @@ import os
 import re
 import threading
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget
 
 from .composition import _composition_item_label, match_composition_components, read_chitu_hook_model_names, suggest_composition_matches
 from .ctb_file import extract_ctb_machine_name
@@ -26,6 +26,7 @@ class PickerWindow(QMainWindow):
     _printers_signal = Signal(list, str)           # printers, error message ("" if ok)
     _retry_signal = Signal(list)                   # targets(list[dict]) - one row's own retry, not the whole-batch state
     _composition_signal = Signal(list, str)        # warehouse components, error message ("" if ok)
+    closed = Signal(object)                        # emitted from closeEvent - PickerHost drops this window's tab
 
     def __init__(self, file_path, filename, machine_name, chitubox_conn=None):
         super().__init__()
@@ -203,7 +204,7 @@ class PickerWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.addStretch(1)
-        self.close_btn = QPushButton("Закрыть окно")
+        self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
         self.close_btn.setVisible(False)
         # Two explicit buttons instead of a "start print" checkbox modifying
@@ -688,6 +689,7 @@ class PickerWindow(QMainWindow):
 
                 threading.Thread(target=_notify, daemon=True).start()
         super().closeEvent(event)
+        self.closed.emit(self)
 
 
 _open_windows = []  # keeps PickerWindow instances alive - Qt doesn't hold a Python reference on its own
@@ -732,6 +734,78 @@ def open_picker_window(dest_path, chitubox_conn=None):
     logmsg("=== OPENING PICKER: %s (machine=%r, %d other picker window(s) already open) ===",
            filename, machine_name, len(_open_windows))
     win = PickerWindow(dest_path, filename, machine_name, chitubox_conn=chitubox_conn)
-    win.show()
-    force_window_to_foreground(win)
     _open_windows.append(win)
+    _get_host().add_picker(win)
+
+
+class PickerHost(QMainWindow):
+    """The single top-level window every PickerWindow lives in, one tab per
+    captured file (2026-10-15: sending a batch of plates used to open one
+    top-level window each - ten entries in Alt-Tab/the taskbar). The host
+    shows itself when the first tab arrives and hides when the last one is
+    gone; closing the host closes every tab through the normal
+    PickerWindow.closeEvent, so the CHITUBOX close-notify logic is unchanged."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Network sending")
+        self.resize(780, 860)
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setElideMode(Qt.ElideMiddle)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        self.setCentralWidget(self.tabs)
+
+    def add_picker(self, win):
+        win.closed.connect(self._on_picker_closed)
+        idx = self.tabs.addTab(win, win.filename)
+        self.tabs.setTabToolTip(idx, win.filename)
+        self.tabs.setCurrentIndex(idx)
+        self._update_title()
+        self.show()
+        self.raise_()
+        force_window_to_foreground(self)
+
+    def _close_tab(self, index):
+        win = self.tabs.widget(index)
+        if win is not None:
+            win.close()  # closeEvent -> closed signal -> _on_picker_closed removes the tab
+
+    def _on_picker_closed(self, win):
+        idx = self.tabs.indexOf(win)
+        if idx >= 0:
+            self.tabs.removeTab(idx)
+            win.setParent(None)
+        self._update_title()
+        if self.tabs.count() == 0:
+            self.hide()
+
+    def _update_title(self):
+        n = self.tabs.count()
+        self.setWindowTitle("Network sending" if n <= 1 else "Network sending — %d плит(ы)" % n)
+
+    def closeEvent(self, event):
+        if self.tabs.count() > 1:
+            answer = QMessageBox.question(
+                self, "Network sending",
+                "Закрыть окно вместе с %d плитами, не отправив их?" % self.tabs.count())
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+        for i in reversed(range(self.tabs.count())):
+            win = self.tabs.widget(i)
+            if win is not None:
+                win.close()
+        super().closeEvent(event)
+
+
+_host = None  # the one PickerHost, created on first use (needs a QApplication)
+
+
+def _get_host():
+    global _host
+    if _host is None:
+        _host = PickerHost()
+    return _host
