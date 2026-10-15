@@ -9,7 +9,7 @@ send_in_background()'s tests."""
 import threading
 from unittest.mock import MagicMock
 
-import slm_chitu_send
+from chitu_send import capture, logs, protocol
 
 
 class TestRedactSecrets:
@@ -17,45 +17,45 @@ class TestRedactSecrets:
             '"Password": "hunter2-pa\\"ss", "Theme": 0}}, "MsgType": "Init"}')
 
     def test_password_and_cookie_values_are_masked(self):
-        out = slm_chitu_send._redact_secrets(self.INIT)
+        out = logs._redact_secrets(self.INIT)
 
         assert "hunter2" not in out and "abc=1" not in out
         assert '"Password": "***"' in out and '"Cookie": "***"' in out
 
     def test_case_insensitive_and_value_cut_off_by_the_chunk_end(self):
-        out = slm_chitu_send._redact_secrets('{"password": "hunter2-and-more')
+        out = logs._redact_secrets('{"password": "hunter2-and-more')
 
         assert "hunter2" not in out and out.endswith('"***"')
 
     def test_other_fields_and_null_cookie_are_untouched(self):
         text = '{"Account": "user@example.com", "Cookie": null, "MsgType": "Init"}'
 
-        assert slm_chitu_send._redact_secrets(text) == text
+        assert logs._redact_secrets(text) == text
 
 
 class TestChituboxConn:
     def test_send_delegates_to_underlying_socket(self):
         raw = MagicMock()
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         assert chandle.send(b"hello") is True
         raw.send.assert_called_once_with(b"hello")
 
     def test_recv_delegates_to_underlying_socket(self):
         raw = MagicMock()
         raw.recv.return_value = b"data"
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         assert chandle.recv(65536) == b"data"
         raw.recv.assert_called_once_with(65536)
 
     def test_send_failure_returns_false_not_raise(self):
         raw = MagicMock()
         raw.send.side_effect = OSError("boom")
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         assert chandle.send(b"hello") is False
 
     def test_close_is_idempotent(self):
         raw = MagicMock()
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         chandle.close()
         chandle.close()  # must not raise or double-close the real socket
         raw.close.assert_called_once()
@@ -68,7 +68,7 @@ class TestChituboxConn:
         # close() is a clean, expected no-op rather than touching an
         # already-closed (or reused-fd) socket object at all.
         raw = MagicMock()
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         chandle.close()
         raw.send.reset_mock()
         assert chandle.send(b"hello") is False
@@ -77,7 +77,7 @@ class TestChituboxConn:
     def test_close_swallows_oserror(self):
         raw = MagicMock()
         raw.close.side_effect = OSError("already gone")
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         chandle.close()  # must not raise
 
     def test_concurrent_send_and_close_do_not_raise(self):
@@ -86,7 +86,7 @@ class TestChituboxConn:
         # from multiple threads at once doesn't crash or deadlock, unlike
         # the old bare socket.send()/socket.close() with no lock at all.
         raw = MagicMock()
-        chandle = slm_chitu_send._ChituboxConn(raw)
+        chandle = protocol._ChituboxConn(raw)
         errors = []
 
         def _sender():
@@ -111,35 +111,35 @@ class TestChituboxConn:
 
 class TestGooHookConvertEnabled:
     def test_missing_flag_file_means_enabled(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(slm_chitu_send, "_V5CONVERT_FLAG_PATH", str(tmp_path / "does_not_exist.flag"))
-        assert slm_chitu_send._goo_hook_convert_enabled() is True
+        monkeypatch.setattr(capture, "_V5CONVERT_FLAG_PATH", str(tmp_path / "does_not_exist.flag"))
+        assert capture._goo_hook_convert_enabled() is True
 
     def test_flag_content_zero_means_disabled(self, tmp_path, monkeypatch):
         # Matches goo_hook.c's V5_IsConvertEnabled() exactly: a leading '0'
         # byte, and only a leading '0', means disabled.
         flag = tmp_path / "flag"
         flag.write_bytes(b"0")
-        monkeypatch.setattr(slm_chitu_send, "_V5CONVERT_FLAG_PATH", str(flag))
-        assert slm_chitu_send._goo_hook_convert_enabled() is False
+        monkeypatch.setattr(capture, "_V5CONVERT_FLAG_PATH", str(flag))
+        assert capture._goo_hook_convert_enabled() is False
 
     def test_any_other_content_means_enabled(self, tmp_path, monkeypatch):
         flag = tmp_path / "flag"
         flag.write_bytes(b"1")
-        monkeypatch.setattr(slm_chitu_send, "_V5CONVERT_FLAG_PATH", str(flag))
-        assert slm_chitu_send._goo_hook_convert_enabled() is True
+        monkeypatch.setattr(capture, "_V5CONVERT_FLAG_PATH", str(flag))
+        assert capture._goo_hook_convert_enabled() is True
 
     def test_empty_flag_file_means_enabled(self, tmp_path, monkeypatch):
         flag = tmp_path / "flag"
         flag.write_bytes(b"")
-        monkeypatch.setattr(slm_chitu_send, "_V5CONVERT_FLAG_PATH", str(flag))
-        assert slm_chitu_send._goo_hook_convert_enabled() is True
+        monkeypatch.setattr(capture, "_V5CONVERT_FLAG_PATH", str(flag))
+        assert capture._goo_hook_convert_enabled() is True
 
 
 class TestLooksLikeNativeV3Goo:
     def test_true_for_v3_magic(self, tmp_path):
         f = tmp_path / "x.goo"
         f.write_bytes(b"V3.0" + b"\x00" * 100)
-        assert slm_chitu_send._looks_like_native_v3_goo(str(f)) is True
+        assert capture._looks_like_native_v3_goo(str(f)) is True
 
     def test_false_for_v5_magic(self, tmp_path):
         # 2026-09-08 (code-review fix, finding #2): once goo_hook.dll has
@@ -147,7 +147,7 @@ class TestLooksLikeNativeV3Goo:
         # mistaken for a still-native, safe-to-forward v3 file.
         f = tmp_path / "x.goo"
         f.write_bytes(b"V5.1" + b"\x00" * 100)
-        assert slm_chitu_send._looks_like_native_v3_goo(str(f)) is False
+        assert capture._looks_like_native_v3_goo(str(f)) is False
 
     def test_false_for_truncated_mid_rewrite_file(self, tmp_path):
         # The exact race window this guards: goo_hook.c's CREATE_ALWAYS
@@ -156,7 +156,7 @@ class TestLooksLikeNativeV3Goo:
         # trustworthy v3 file either.
         f = tmp_path / "x.goo"
         f.write_bytes(b"")
-        assert slm_chitu_send._looks_like_native_v3_goo(str(f)) is False
+        assert capture._looks_like_native_v3_goo(str(f)) is False
 
     def test_false_for_missing_file(self, tmp_path):
-        assert slm_chitu_send._looks_like_native_v3_goo(str(tmp_path / "nope.goo")) is False
+        assert capture._looks_like_native_v3_goo(str(tmp_path / "nope.goo")) is False

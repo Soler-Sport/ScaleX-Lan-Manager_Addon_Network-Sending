@@ -44,8 +44,8 @@ ScaleX LAN Manager.
    зависимости именно в тот интерпретатор, путь к которому прописан в
    `.vbs`.
 
-3. Открыть [`slm_chitu_send.py`](slm_chitu_send.py) и поправить под свою ферму
-   константы в начале файла (поиск по `SCALEX_HOST`):
+3. Открыть [`chitu_send/config.py`](chitu_send/config.py) и поправить под свою ферму
+   константы (поиск по `SCALEX_HOST`):
 
    ```python
    SCALEX_HOST = "192.168.0.118"   # IP или хост вашего ScaleX LAN Manager
@@ -120,8 +120,8 @@ ScaleX LAN Manager.
 Чтобы отключить — удалить ярлык из папки Startup, сам `.vbs` можно не
 трогать.
 
-Чтобы перезапустить вручную после правок `slm_chitu_send.py` (например,
-поменяли `SCALEX_HOST`): закрыть все процессы `python.exe`/`pythonw.exe`,
+Чтобы перезапустить вручную после правок кода (например,
+поменяли `SCALEX_HOST` в `chitu_send/config.py`): закрыть все процессы `python.exe`/`pythonw.exe`,
 запустившие `slm_chitu_send.py` (через «Выход» в меню трея, либо диспетчер
 задач), и запустить заново — двойным кликом по `slm_chitu_send_autostart.vbs`,
 либо `python slm_chitu_send.py` из консоли, если нужно видеть лог живьём.
@@ -154,8 +154,8 @@ ScaleX LAN Manager.
   even after the Alt-keypress trick` — окно всё равно открывается, просто
   без автофокуса, ищите его на панели задач/в Alt-Tab.
 - **Реальный принтер начал печать без включённой галочки «Запустить
-  печать»** — не должно происходить (см. SESSION NOTES в самом
-  `slm_chitu_send.py` про отказ от `bulk-uploads/from-draft`), но если
+  печать»** — не должно происходить (см. SESSION NOTES в
+  `chitu_send/__init__.py` про отказ от `bulk-uploads/from-draft`), но если
   увидите это — немедленно сообщите: это будет означать, что ScaleX
   сам поменял поведение своего API.
 
@@ -262,7 +262,7 @@ ScaleX (`suggestedCtbCompositionArticles` в его `app.js`) угадывает
 `goo_hook.dll` (см. «Файлы в папке» ниже) перехватывает у CHITUBOX Pro
 момент сохранения среза и пишет рядом с `.ctb` JSON-файл с оригинальными
 именами всех моделей на плите (`FL_HookedSaveSlice` в `goo_hook.c`).
-`slm_chitu_send.py` читает этот JSON (`read_chitu_hook_model_names`) и
+`chitu_send/composition.py` читает этот JSON (`read_chitu_hook_model_names`) и
 сравнивает каждое имя со складскими компонентами (`code`/`name`) —
 **точным** совпадением (без учёта регистра/пробелов), не подстрокой
 (`match_composition_components`). Панель с результатом — под полем имени
@@ -290,20 +290,23 @@ ScaleX (`suggestedCtbCompositionArticles` в его `app.js`) угадывает
 подтверждённо работает `X-Start-Print`/`autoStart` — «поставить в очередь
 без печати» либо «поставить и сразу напечатать», в зависимости от
 галочки. Bulk/`from-draft` эндпоинты ScaleX **намеренно не используются**
-(см. SESSION NOTES в `slm_chitu_send.py`) — они помечены как
+(см. SESSION NOTES в `chitu_send/__init__.py`) — они помечены как
 «экспериментальные» в самом ответе ScaleX и однажды запустили печать на
 живом принтере, даже не получив в запросе ни одного поля про автостарт.
 
 ## Файлы в папке
 
-- `slm_chitu_send.py` — рабочий файл, всё описанное выше.
+- `slm_chitu_send.py` — точка входа (`python slm_chitu_send.py`), сам код лежит в пакете `chitu_send/`.
+- `chitu_send/` — рабочий код, разбит по модулям (раскладка — в начале `chitu_send/__init__.py`):
+  `config` (настройки), `protocol` (протокол CHITUBOX), `scalex` (API ScaleX), `sender`
+  (отправка), `composition` (состав CTB), `picker`/`printer_row`/`tray` (интерфейс) и др.
 - `slm_chitu_send_autostart.vbs` — тихий запуск для автозагрузки (см.
   «Автозапуск» выше — создаётся один раз при установке).
 - `data/` — рабочие данные (раньше жили отдельно в `C:\own_manager`,
   2026-09-25 слиты в сам проект): `pending/`, `received/`,
   `slm_chitu_send.log`.
 - `goo_hook/` — исходник DLL-хука на CHITUBOX Pro (`goo_hook.c` +
-  `qml_probe.cpp`), который `slm_chitu_send.py` сам инжектит в каждый
+  `qml_probe.cpp`), который `chitu_send/hook_injector.py` сам инжектит в каждый
   новый процесс CHITUBOX Pro.exe (см. «Состав CTB» ниже) — свой
   `build.bat`, собранная `.dll` в git не попадает.
 
@@ -339,7 +342,7 @@ ScaleX (`suggestedCtbCompositionArticles` в его `app.js`) угадывает
    доступа к ScaleX, до первого реального запуска на рабочей машине) —
    не баг архитектуры, а просто устаревший черновик; актуальные цвета
    сведены с живого `styles.css` ScaleX, см. `COLOR_*`/`PICKER_QSS` в
-   `slm_chitu_send.py`.
+   `chitu_send/theme.py`.
 
 Текущая схема (прямой TCP-триггер `SaveFile` + нативный Qt-пикер) обходит
 все проблемы выше — ChituManager вообще не участвует, а значит и его

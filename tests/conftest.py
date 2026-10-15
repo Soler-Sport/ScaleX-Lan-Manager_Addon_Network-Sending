@@ -26,18 +26,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-import slm_chitu_send
+from chitu_send import ctb_file, logs
 
 
 @pytest.fixture(autouse=True)
 def _isolate_logmsg(monkeypatch):
-    monkeypatch.setattr(slm_chitu_send, "_logf", io.StringIO())
+    monkeypatch.setattr(logs, "_logf", io.StringIO())
 
 
 @pytest.fixture
 def make_ctb_file(tmp_path):
     """Builds a real, byte-valid "CTB Encrypted" file exercising the exact
-    format slm_chitu_send._extract_ctb_machine_name_precise() parses: a
+    format ctb_file._extract_ctb_machine_name_precise() parses: a
     plaintext FileHeader pointing at an AES-256-CBC-encrypted
     SlicerSettings block (encrypted with the format's own fixed,
     XOR-obfuscated key/IV - same derivation the real code uses), whose
@@ -52,25 +52,25 @@ def make_ctb_file(tmp_path):
 
     def _build(machine_name="ELEGOO Saturn 4 Ultra 16K", filename="synthetic.ctb",
                truncate_header=False, wrong_magic=False, mismatched_settings_size=False):
-        header_size = struct.calcsize(slm_chitu_send._CTB_HEADER_FMT)
-        settings_size = struct.calcsize(slm_chitu_send._CTB_SETTINGS_FMT)
+        header_size = struct.calcsize(ctb_file._CTB_HEADER_FMT)
+        settings_size = struct.calcsize(ctb_file._CTB_SETTINGS_FMT)
         name_bytes = machine_name.encode("ascii")
         name_offset = header_size + settings_size
 
-        settings_vals = [0] * len(slm_chitu_send._CTB_SETTINGS_FIELDS)
-        settings_vals[slm_chitu_send._CTB_SETTINGS_INDEX["MachineNameOffset"]] = name_offset
-        settings_vals[slm_chitu_send._CTB_SETTINGS_INDEX["MachineNameSize"]] = len(name_bytes)
-        settings_plain = struct.pack(slm_chitu_send._CTB_SETTINGS_FMT, *settings_vals)
+        settings_vals = [0] * len(ctb_file._CTB_SETTINGS_FIELDS)
+        settings_vals[ctb_file._CTB_SETTINGS_INDEX["MachineNameOffset"]] = name_offset
+        settings_vals[ctb_file._CTB_SETTINGS_INDEX["MachineNameSize"]] = len(name_bytes)
+        settings_plain = struct.pack(ctb_file._CTB_SETTINGS_FMT, *settings_vals)
 
-        key = slm_chitu_send._ctb_xor(base64.b64decode(slm_chitu_send._CTB_AES_KEY_B64), slm_chitu_send._CTB_XOR_PASSPHRASE)
-        iv = slm_chitu_send._ctb_xor(base64.b64decode(slm_chitu_send._CTB_AES_IV_B64), slm_chitu_send._CTB_XOR_PASSPHRASE)
+        key = ctb_file._ctb_xor(base64.b64decode(ctb_file._CTB_AES_KEY_B64), ctb_file._CTB_XOR_PASSPHRASE)
+        iv = ctb_file._ctb_xor(base64.b64decode(ctb_file._CTB_AES_IV_B64), ctb_file._CTB_XOR_PASSPHRASE)
         settings_encrypted = AES.new(key, AES.MODE_CBC, iv).encrypt(settings_plain)
 
-        header_vals = [0] * len(slm_chitu_send._CTB_HEADER_FIELDS)
-        header_vals[0] = 0xBADBEEF if wrong_magic else slm_chitu_send.CTB_ENCRYPTED_MAGIC  # Magic
+        header_vals = [0] * len(ctb_file._CTB_HEADER_FIELDS)
+        header_vals[0] = 0xBADBEEF if wrong_magic else ctb_file.CTB_ENCRYPTED_MAGIC  # Magic
         header_vals[1] = settings_size + (1 if mismatched_settings_size else 0)  # SettingsSize
         header_vals[2] = header_size  # SettingsOffset
-        header_bytes = struct.pack(slm_chitu_send._CTB_HEADER_FMT, *header_vals)
+        header_bytes = struct.pack(ctb_file._CTB_HEADER_FMT, *header_vals)
         if truncate_header:
             header_bytes = header_bytes[:-4]
 

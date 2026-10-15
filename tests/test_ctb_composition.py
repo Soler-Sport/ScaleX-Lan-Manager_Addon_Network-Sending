@@ -7,7 +7,7 @@ own pattern, so these never touch a real network."""
 import json
 from unittest.mock import MagicMock, patch
 
-import slm_chitu_send
+from chitu_send import composition, scalex
 
 
 def _mock_conn(status=200, body=b'{"ok": true}'):
@@ -26,7 +26,7 @@ class TestReadChituHookModelNames:
         (tmp_path / "Box F x8.json").write_text(
             json.dumps(["133_SOPLI_KRAN_7.stl", "134_SOPLI_KRAN_8.stl"]), encoding="utf-8")
 
-        names = slm_chitu_send.read_chitu_hook_model_names(str(ctb))
+        names = composition.read_chitu_hook_model_names(str(ctb))
 
         assert names == ["133_SOPLI_KRAN_7.stl", "134_SOPLI_KRAN_8.stl"]
 
@@ -34,21 +34,21 @@ class TestReadChituHookModelNames:
         ctb = tmp_path / "no_sidecar.ctb"
         ctb.write_bytes(b"x")
 
-        assert slm_chitu_send.read_chitu_hook_model_names(str(ctb)) is None
+        assert composition.read_chitu_hook_model_names(str(ctb)) is None
 
     def test_malformed_sidecar_returns_none(self, tmp_path):
         ctb = tmp_path / "bad.ctb"
         ctb.write_bytes(b"x")
         (tmp_path / "bad.json").write_text("not valid json{", encoding="utf-8")
 
-        assert slm_chitu_send.read_chitu_hook_model_names(str(ctb)) is None
+        assert composition.read_chitu_hook_model_names(str(ctb)) is None
 
     def test_non_list_json_returns_none(self, tmp_path):
         ctb = tmp_path / "obj.ctb"
         ctb.write_bytes(b"x")
         (tmp_path / "obj.json").write_text(json.dumps({"not": "a list"}), encoding="utf-8")
 
-        assert slm_chitu_send.read_chitu_hook_model_names(str(ctb)) is None
+        assert composition.read_chitu_hook_model_names(str(ctb)) is None
 
 
 class TestMatchCompositionComponents:
@@ -66,7 +66,7 @@ class TestMatchCompositionComponents:
     ]
 
     def test_exact_match_is_case_insensitive_and_extension_stripped(self):
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["wm-24001w:la.stl"], self.COMPONENTS)
 
         assert matched == [(self.COMPONENTS[0], 1)]
@@ -74,7 +74,7 @@ class TestMatchCompositionComponents:
         assert unmatched == []
 
     def test_counts_repeated_models_as_quantity(self):
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["WM-24001W:LA.stl", "WM-24001W:LA.stl", "WM-24001W:LA.stl"], self.COMPONENTS)
 
         assert matched == [(self.COMPONENTS[0], 3)]
@@ -86,7 +86,7 @@ class TestMatchCompositionComponents:
         # has a ":LA"/":RA" suffix it lacks) - a model name that only
         # partially overlaps a code must NOT match. This is the whole point
         # of not reusing ScaleX's own fuzzy browser-side logic.
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["WM-24001W.stl"], self.COMPONENTS)
 
         assert matched == []
@@ -94,7 +94,7 @@ class TestMatchCompositionComponents:
         assert unmatched == ["WM-24001W.stl"]
 
     def test_unrecognized_model_goes_to_unmatched(self):
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["some_unrelated_part.stl"], self.COMPONENTS)
 
         assert matched == []
@@ -102,7 +102,7 @@ class TestMatchCompositionComponents:
         assert unmatched == ["some_unrelated_part.stl"]
 
     def test_mixed_matched_and_unmatched(self):
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["WM-24001W:LA.stl", "mystery_part.stl", "WM-24001W:RA.stl"], self.COMPONENTS)
 
         assert sorted(matched, key=lambda pair: pair[0]["id"]) == [
@@ -111,7 +111,7 @@ class TestMatchCompositionComponents:
         assert unmatched == ["mystery_part.stl"]
 
     def test_same_name_different_article_is_ambiguous_not_silently_picked(self):
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["Кронштейн универсальный.stl"], self.SAME_NAME_COMPONENTS)
 
         assert matched == []
@@ -123,7 +123,7 @@ class TestMatchCompositionComponents:
         assert sorted(candidates, key=lambda c: c["id"]) == self.SAME_NAME_COMPONENTS
 
     def test_ambiguous_match_counts_repeats_as_one_group(self):
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["Кронштейн универсальный.stl", "Кронштейн универсальный.stl"], self.SAME_NAME_COMPONENTS)
 
         assert matched == []
@@ -142,7 +142,7 @@ class TestMatchCompositionComponents:
              "deletedAt": "2026-09-11T10:16:18+00:00"},
             {"id": "live", "code": None, "name": "WW-35029_S", "deletedAt": None},
         ]
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["WW-35029_S.stl"], components)
 
         assert matched == [(components[1], 1)]
@@ -152,7 +152,7 @@ class TestMatchCompositionComponents:
     def test_only_deleted_component_matching_goes_to_unmatched(self):
         components = [{"id": "old", "code": None, "name": "Gone Part",
                        "deletedAt": "2026-09-11T10:16:18+00:00"}]
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["Gone Part.stl"], components)
 
         assert matched == []
@@ -161,7 +161,7 @@ class TestMatchCompositionComponents:
 
     def test_ambiguous_and_unambiguous_matches_stay_independent(self):
         components = self.COMPONENTS + self.SAME_NAME_COMPONENTS
-        matched, ambiguous, unmatched = slm_chitu_send.match_composition_components(
+        matched, ambiguous, unmatched = composition.match_composition_components(
             ["WM-24001W:LA.stl", "Кронштейн универсальный.stl"], components)
 
         assert matched == [(self.COMPONENTS[0], 1)]
@@ -177,7 +177,7 @@ class TestSuggestCompositionMatches:
     ]
 
     def test_suggests_near_miss_prefix_typo(self):
-        hints = slm_chitu_send.suggest_composition_matches(["WW-35042_L_A.stl"], self.COMPONENTS)
+        hints = composition.suggest_composition_matches(["WW-35042_L_A.stl"], self.COMPONENTS)
 
         assert hints == {"WW-35042_L_A.stl": ["WM-35042_L_A"]}
 
@@ -186,20 +186,20 @@ class TestSuggestCompositionMatches:
         # silently pick one.
         components = self.COMPONENTS + [
             {"id": "c", "code": None, "name": "WW-35032_L_A", "deletedAt": None}]
-        hints = slm_chitu_send.suggest_composition_matches(["WW-35042_L_A.stl"], components)
+        hints = composition.suggest_composition_matches(["WW-35042_L_A.stl"], components)
 
         assert sorted(hints["WW-35042_L_A.stl"]) == ["WM-35042_L_A", "WW-35032_L_A"]
 
     def test_no_suggestion_for_unrelated_name(self):
-        assert slm_chitu_send.suggest_composition_matches(["Box(17,18).stl"], self.COMPONENTS) == {}
+        assert composition.suggest_composition_matches(["Box(17,18).stl"], self.COMPONENTS) == {}
 
     def test_deleted_components_are_never_suggested(self):
-        hints = slm_chitu_send.suggest_composition_matches(["WW-35042_L_C.stl"], self.COMPONENTS)
+        hints = composition.suggest_composition_matches(["WW-35042_L_C.stl"], self.COMPONENTS)
 
         assert "WW-35042_L_C" not in [label for labels in hints.values() for label in labels]
 
     def test_repeated_names_are_deduplicated(self):
-        hints = slm_chitu_send.suggest_composition_matches(
+        hints = composition.suggest_composition_matches(
             ["WW-35042_L_A.stl"] * 5, self.COMPONENTS)
 
         assert list(hints) == ["WW-35042_L_A.stl"]
@@ -211,29 +211,29 @@ class TestFetchWarehouseComponents:
             "components": [{"id": "c1", "code": "X:Y", "name": "n"}],
             "articles": [],
         }).encode("utf-8"))
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            components = slm_chitu_send.fetch_warehouse_components()
+        with patch("http.client.HTTPConnection", return_value=conn):
+            components = scalex.fetch_warehouse_components()
 
         assert components == [{"id": "c1", "code": "X:Y", "name": "n"}]
         assert conn.request.call_args[0] == ("GET", "/api/warehouse")
 
     def test_default_context_sends_no_context_header(self):
         conn = _mock_conn(body=b'{"components": []}')
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            slm_chitu_send.fetch_warehouse_components()
+        with patch("http.client.HTTPConnection", return_value=conn):
+            scalex.fetch_warehouse_components()
         assert conn.request.call_args[1]["headers"] == {}
 
     def test_orders_context_sends_header(self):
         conn = _mock_conn(body=b'{"components": []}')
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            slm_chitu_send.fetch_warehouse_components("orders")
+        with patch("http.client.HTTPConnection", return_value=conn):
+            scalex.fetch_warehouse_components("orders")
         assert conn.request.call_args[1]["headers"] == {"X-Warehouse-Context": "orders"}
 
     def test_fetch_all_tags_each_component_with_its_context(self):
         def fake(context="warehouse"):
             return {"warehouse": [{"id": "w1", "name": "A"}], "orders": [{"id": "o1", "name": "Box(17,18)"}]}[context]
-        with patch("slm_chitu_send.fetch_warehouse_components", side_effect=fake):
-            comps = slm_chitu_send.fetch_all_warehouse_components()
+        with patch("chitu_send.scalex.fetch_warehouse_components", side_effect=fake):
+            comps = scalex.fetch_all_warehouse_components()
         assert comps == [{"id": "w1", "name": "A", "warehouseContext": "warehouse"},
                          {"id": "o1", "name": "Box(17,18)", "warehouseContext": "orders"}]
 
@@ -242,28 +242,28 @@ class TestFetchWarehouseComponents:
             if context == "orders":
                 raise RuntimeError("HTTP 500")
             return [{"id": "w1", "name": "A"}]
-        with patch("slm_chitu_send.fetch_warehouse_components", side_effect=orders_down):
-            assert [c["id"] for c in slm_chitu_send.fetch_all_warehouse_components()] == ["w1"]
+        with patch("chitu_send.scalex.fetch_warehouse_components", side_effect=orders_down):
+            assert [c["id"] for c in scalex.fetch_all_warehouse_components()] == ["w1"]
 
         def main_down(context="warehouse"):
             raise RuntimeError("HTTP 500")
-        with patch("slm_chitu_send.fetch_warehouse_components", side_effect=main_down):
+        with patch("chitu_send.scalex.fetch_warehouse_components", side_effect=main_down):
             try:
-                slm_chitu_send.fetch_all_warehouse_components()
+                scalex.fetch_all_warehouse_components()
                 assert False, "expected RuntimeError"
             except RuntimeError:
                 pass
 
     def test_missing_components_key_returns_empty_list(self):
         conn = _mock_conn(body=b'{"articles": []}')
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            assert slm_chitu_send.fetch_warehouse_components() == []
+        with patch("http.client.HTTPConnection", return_value=conn):
+            assert scalex.fetch_warehouse_components() == []
 
     def test_non_200_raises(self):
         conn = _mock_conn(status=500, body=b'{}')
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+        with patch("http.client.HTTPConnection", return_value=conn):
             try:
-                slm_chitu_send.fetch_warehouse_components()
+                scalex.fetch_warehouse_components()
                 assert False, "expected RuntimeError"
             except RuntimeError:
                 pass
@@ -272,8 +272,8 @@ class TestFetchWarehouseComponents:
 class TestSaveCtbComposition:
     def test_puts_correct_path_and_body(self):
         conn = _mock_conn(status=200)
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            slm_chitu_send.save_ctb_composition("Box F x8.ctb", [("comp-1", 3), ("comp-2", 1)])
+        with patch("http.client.HTTPConnection", return_value=conn):
+            scalex.save_ctb_composition("Box F x8.ctb", [("comp-1", 3), ("comp-2", 1)])
 
         call_args = conn.request.call_args
         assert call_args[0][0] == "PUT"
@@ -288,20 +288,20 @@ class TestSaveCtbComposition:
 
     def test_orders_context_adds_header_default_does_not(self):
         conn = _mock_conn(status=200)
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            slm_chitu_send.save_ctb_composition("Box x30.ctb", [("o1", 30)], context="orders")
+        with patch("http.client.HTTPConnection", return_value=conn):
+            scalex.save_ctb_composition("Box x30.ctb", [("o1", 30)], context="orders")
         assert conn.request.call_args[1]["headers"]["X-Warehouse-Context"] == "orders"
 
         conn = _mock_conn(status=200)
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
-            slm_chitu_send.save_ctb_composition("Box x30.ctb", [("w1", 30)])
+        with patch("http.client.HTTPConnection", return_value=conn):
+            scalex.save_ctb_composition("Box x30.ctb", [("w1", 30)])
         assert "X-Warehouse-Context" not in conn.request.call_args[1]["headers"]
 
     def test_non_2xx_raises(self):
         conn = _mock_conn(status=400, body=b'{"error": "bad request"}')
-        with patch("slm_chitu_send.http.client.HTTPConnection", return_value=conn):
+        with patch("http.client.HTTPConnection", return_value=conn):
             try:
-                slm_chitu_send.save_ctb_composition("f.ctb", [("comp-1", 1)])
+                scalex.save_ctb_composition("f.ctb", [("comp-1", 1)])
                 assert False, "expected RuntimeError"
             except RuntimeError:
                 pass

@@ -14,7 +14,7 @@ would have been emitted."""
 import os
 import time
 
-import slm_chitu_send
+from chitu_send import app_controller, capture, config, watchers
 
 
 class _FakeController:
@@ -37,17 +37,17 @@ def _age_file(path, seconds_old):
 
 
 def test_young_file_is_skipped_and_not_marked_seen(tmp_path, monkeypatch):
-    monkeypatch.setattr(slm_chitu_send, "PENDING_DIR", str(tmp_path))
-    monkeypatch.setattr(slm_chitu_send, "PENDING_ORPHAN_GRACE_SEC", 120)
+    monkeypatch.setattr(config, "PENDING_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "PENDING_ORPHAN_GRACE_SEC", 120)
     fake = _FakeController()
-    monkeypatch.setattr(slm_chitu_send, "controller", fake)
+    monkeypatch.setattr(app_controller, "controller", fake)
 
     f = tmp_path / "job_abc12345.ctb"
     f.write_bytes(b"x" * 100)  # fresh - mtime is "now", well under the grace period
 
     seen = set()
-    slm_chitu_send._pending_dir_watcher_pass(seen)
-    slm_chitu_send._pending_dir_watcher_pass(seen)  # a second pass - still too young
+    watchers._pending_dir_watcher_pass(seen)
+    watchers._pending_dir_watcher_pass(seen)  # a second pass - still too young
 
     assert fake.captured == []
     assert seen == set()  # deliberately never marked "seen" while still too young
@@ -55,16 +55,16 @@ def test_young_file_is_skipped_and_not_marked_seen(tmp_path, monkeypatch):
 
 
 def test_v5_prefixed_file_is_always_skipped(tmp_path, monkeypatch):
-    monkeypatch.setattr(slm_chitu_send, "PENDING_DIR", str(tmp_path))
-    monkeypatch.setattr(slm_chitu_send, "PENDING_ORPHAN_GRACE_SEC", 1)
+    monkeypatch.setattr(config, "PENDING_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "PENDING_ORPHAN_GRACE_SEC", 1)
     fake = _FakeController()
-    monkeypatch.setattr(slm_chitu_send, "controller", fake)
+    monkeypatch.setattr(app_controller, "controller", fake)
 
     f = tmp_path / "v5_job_abc12345.goo"
     f.write_bytes(b"V5.1" + b"x" * 100)
     _age_file(f, seconds_old=999)  # old enough that only the v5_ prefix could be saving it
 
-    slm_chitu_send._pending_dir_watcher_pass(set())
+    watchers._pending_dir_watcher_pass(set())
 
     assert fake.captured == []
     assert f.exists()  # a real live capture (or handle_client()'s own thread) owns this file, not this watcher
@@ -74,18 +74,18 @@ def test_orphaned_ctb_file_gets_captured(tmp_path, monkeypatch):
     pending = tmp_path / "pending"
     received = tmp_path / "received"
     pending.mkdir()
-    monkeypatch.setattr(slm_chitu_send, "PENDING_DIR", str(pending))
-    monkeypatch.setattr(slm_chitu_send, "RECEIVED_DIR", str(received))
-    monkeypatch.setattr(slm_chitu_send, "PENDING_ORPHAN_GRACE_SEC", 1)
+    monkeypatch.setattr(config, "PENDING_DIR", str(pending))
+    monkeypatch.setattr(config, "RECEIVED_DIR", str(received))
+    monkeypatch.setattr(config, "PENDING_ORPHAN_GRACE_SEC", 1)
     fake = _FakeController()
-    monkeypatch.setattr(slm_chitu_send, "controller", fake)
+    monkeypatch.setattr(app_controller, "controller", fake)
 
     f = pending / "Box(1,2)_deadbeef.ctb"
     f.write_bytes(b"fake ctb bytes")
     _age_file(f, seconds_old=999)
 
     seen = set()
-    slm_chitu_send._pending_dir_watcher_pass(seen)
+    watchers._pending_dir_watcher_pass(seen)
 
     # Captured into RECEIVED_DIR, PENDING copy removed, picker signal fired
     # with chandle=None (no live connection - this is exactly what
@@ -105,10 +105,10 @@ def test_file_claimed_by_live_connection_during_wait_is_left_alone(tmp_path, mon
     capture."""
     pending = tmp_path / "pending"
     pending.mkdir()
-    monkeypatch.setattr(slm_chitu_send, "PENDING_DIR", str(pending))
-    monkeypatch.setattr(slm_chitu_send, "PENDING_ORPHAN_GRACE_SEC", 1)
+    monkeypatch.setattr(config, "PENDING_DIR", str(pending))
+    monkeypatch.setattr(config, "PENDING_ORPHAN_GRACE_SEC", 1)
     fake = _FakeController()
-    monkeypatch.setattr(slm_chitu_send, "controller", fake)
+    monkeypatch.setattr(app_controller, "controller", fake)
 
     f = pending / "Box(1,2)_deadbeef.ctb"
     f.write_bytes(b"fake ctb bytes")
@@ -117,9 +117,9 @@ def test_file_claimed_by_live_connection_during_wait_is_left_alone(tmp_path, mon
     def _stability_wait_but_someone_else_grabs_it(path, max_polls, poll_interval=0.2):
         os.remove(path)
 
-    monkeypatch.setattr(slm_chitu_send, "_wait_for_stable_file", _stability_wait_but_someone_else_grabs_it)
+    monkeypatch.setattr(watchers, "_wait_for_stable_file", _stability_wait_but_someone_else_grabs_it)
 
-    slm_chitu_send._pending_dir_watcher_pass(set())
+    watchers._pending_dir_watcher_pass(set())
 
     assert fake.captured == []  # this watcher did nothing - the live path already won
 
@@ -131,21 +131,21 @@ def test_orphaned_goo_file_dispatches_to_finish_goo_v5_capture(tmp_path, monkeyp
     pending = tmp_path / "pending"
     received = tmp_path / "received"
     pending.mkdir()
-    monkeypatch.setattr(slm_chitu_send, "PENDING_DIR", str(pending))
-    monkeypatch.setattr(slm_chitu_send, "RECEIVED_DIR", str(received))
-    monkeypatch.setattr(slm_chitu_send, "PENDING_ORPHAN_GRACE_SEC", 1)
+    monkeypatch.setattr(config, "PENDING_DIR", str(pending))
+    monkeypatch.setattr(config, "RECEIVED_DIR", str(received))
+    monkeypatch.setattr(config, "PENDING_ORPHAN_GRACE_SEC", 1)
     fake = _FakeController()
-    monkeypatch.setattr(slm_chitu_send, "controller", fake)
+    monkeypatch.setattr(app_controller, "controller", fake)
     # Skip the real up-to-60s wait entirely - _goo_hook_convert_enabled()
     # is exercised on its own in test_chitubox_protocol.py; here we only
     # care that _pending_dir_watcher_pass() routes to the right function.
-    monkeypatch.setattr(slm_chitu_send, "_goo_hook_convert_enabled", lambda: False)
+    monkeypatch.setattr(capture, "_goo_hook_convert_enabled", lambda: False)
 
     f = pending / "Box(1,2)_deadbeef.goo"
     f.write_bytes(b"V3.0" + b"x" * 100)  # native v3 magic - safe to forward per _looks_like_native_v3_goo
     _age_file(f, seconds_old=999)
 
-    slm_chitu_send._pending_dir_watcher_pass(set())
+    watchers._pending_dir_watcher_pass(set())
 
     assert not f.exists()
     dest = received / "Box(1,2)_deadbeef.goo"
@@ -154,5 +154,5 @@ def test_orphaned_goo_file_dispatches_to_finish_goo_v5_capture(tmp_path, monkeyp
 
 
 def test_missing_pending_dir_is_a_noop(tmp_path, monkeypatch):
-    monkeypatch.setattr(slm_chitu_send, "PENDING_DIR", str(tmp_path / "does_not_exist"))
-    slm_chitu_send._pending_dir_watcher_pass(set())  # must not raise
+    monkeypatch.setattr(config, "PENDING_DIR", str(tmp_path / "does_not_exist"))
+    watchers._pending_dir_watcher_pass(set())  # must not raise
