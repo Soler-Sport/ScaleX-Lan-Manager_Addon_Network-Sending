@@ -17,7 +17,7 @@ from .logs import logmsg
 from .picker import open_picker_window
 from .protocol import _chitubox_accept_loop
 from .shm import SHM_NAME, create_shared_memory
-from .theme import PICKER_QSS
+from .theme import apply_theme
 from .tray import _make_tray_icon, build_tray_icon, show_waiting_notice
 from .watchdog import _start_hang_watchdog
 from .watchers import _pending_dir_watcher, slicer_file_watcher
@@ -59,7 +59,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # tray-resident: closing every picker window must not exit the app
-    app.setStyleSheet(PICKER_QSS)
+    apply_theme(app)  # ScaleX "Vorten" look: font chain + stylesheet
     app.setWindowIcon(_make_tray_icon())  # every PickerWindow inherits this (taskbar/Alt-Tab), not just the tray
 
     app_controller.controller = AppController()
