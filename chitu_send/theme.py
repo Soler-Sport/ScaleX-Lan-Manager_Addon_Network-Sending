@@ -114,7 +114,8 @@ QTabWidget { background: %(bg)s; }
 QTabBar { background: %(bg)s; border: none; }
 QTabBar QToolButton { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 6px; }
 QTabBar::tab { background: %(panel2)s; color: %(dim)s; border: 1px solid %(line)s; border-bottom: none;
-    border-top-left-radius: 8px; border-top-right-radius: 8px; padding: 7px 12px; margin-right: 2px; max-width: 210px; }
+    border-top-left-radius: 8px; border-top-right-radius: 8px; padding: 7px 28px 7px 12px; margin-right: 2px; max-width: 210px; }
+QTabBar::close-button { subcontrol-origin: padding; subcontrol-position: right; margin-right: 8px; }
 QTabBar::tab:selected { background: %(panel)s; color: %(text)s; border-color: rgba(232, 255, 101, .65); }
 QTabBar::tab:hover { color: %(text)s; }
 QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 5px;
