@@ -1,7 +1,9 @@
+import ctypes
 import json
 import os
 import re
 import threading
+import traceback
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget
 
@@ -757,6 +759,14 @@ class PickerHost(QMainWindow):
         self.tabs.setUsesScrollButtons(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.setCentralWidget(self.tabs)
+        # 2026-10-16: seen live - the host window sat hidden (Windows' IsWindowVisible
+        # False) with three tabs still in it, so the operator never saw the picker
+        # even though captures kept arriving. Cause not pinned down (never
+        # reproduced in a fresh process); this re-shows it and logs the evidence.
+        self._visibility_timer = QTimer(self)
+        self._visibility_timer.setInterval(1500)
+        self._visibility_timer.timeout.connect(self._ensure_visible)
+        self._visibility_timer.start()
 
     def add_picker(self, win):
         win.closed.connect(self._on_picker_closed)
@@ -781,6 +791,28 @@ class PickerHost(QMainWindow):
         self._update_title()
         if self.tabs.count() == 0:
             self.hide()
+
+    def _natively_visible(self):
+        try:
+            return bool(ctypes.windll.user32.IsWindowVisible(int(self.winId())))
+        except Exception:
+            return True  # can't tell - don't second-guess Qt
+
+    def _ensure_visible(self):
+        if self.tabs.count() == 0 or self.isMinimized():
+            return
+        if not self.isVisible() or not self._natively_visible():
+            logmsg("=== PickerHost was hidden with %d tab(s) open (qt visible=%s, native visible=%s) - showing it again ===",
+                   self.tabs.count(), self.isVisible(), self._natively_visible())
+            self.show()
+            self.raise_()
+            force_window_to_foreground(self)
+
+    def hideEvent(self, event):
+        if self.tabs.count() > 0:
+            logmsg("=== PickerHost.hideEvent with %d tab(s) open; stack: %s ===",
+                   self.tabs.count(), "".join(traceback.format_stack(limit=10)))
+        super().hideEvent(event)
 
     def _update_title(self):
         n = self.tabs.count()
