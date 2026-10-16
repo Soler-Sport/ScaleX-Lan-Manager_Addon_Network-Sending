@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Vorten D8 theme for ScaleX LAN Manager
 // @namespace    https://gitlab.vorten.ru/infra
-// @version      1.0
-// @description  Recolors the ScaleX LAN Manager web UI (baseline style) with the Vorten D8 palette: graphite surfaces, red accent, monospace font, square corners. Client-side only, the server is untouched.
+// @version      1.1
+// @description  Adds a "Vorten D8" entry to the ScaleX interface-style picker (Оформление) and recolors the web UI with it: graphite surfaces, red accent, monospace font, square corners. Client-side only, the server is untouched.
 // @match        https://192.168.0.118:8443/*
 // @run-at       document-start
 // @grant        none
@@ -12,17 +12,22 @@
 // Works by fetching every same-origin stylesheet, swapping the ScaleX baseline colors for Vorten ones
 // and inlining the result. Hard-coded rgba(232,255,101,...) lime tints in styles.css make a plain
 // :root variable override insufficient, hence the rewrite.
+// The choice lives in localStorage "vorten.theme" ("off" = disabled, anything else = on, the default).
 // To use it on another ScaleX host, add another @match line.
 (() => {
   "use strict";
 
-  // Forced before appearance-init.js runs: the Vorten palette maps onto the "baseline" style only.
-  try { localStorage.setItem("scalex.appearance.style", "baseline"); } catch { /* storage is optional */ }
+  const KEY = "vorten.theme";
+  const STYLE_KEY = "scalex.appearance.style";  // ScaleX's own style picker value
+  const OPTION_VALUE = "vorten";
 
-  // Avoid a flash of lime while the stylesheets are being rewritten.
-  const veil = document.createElement("style");
-  veil.textContent = "html{background:#0b0b0c!important}body{visibility:hidden}";
-  document.documentElement.appendChild(veil);
+  const readEnabled = () => {
+    try { return localStorage.getItem(KEY) !== "off"; } catch { return true; }
+  };
+  const store = (key, value) => {
+    try { localStorage.setItem(key, value); } catch { /* storage is optional */ }
+  };
+  const enabled = readEnabled();
 
   const COLOR_MAP = [
     [/rgba\(\s*232\s*,\s*255\s*,\s*101/gi, "rgba(255,77,77"],  // accent tints
@@ -53,7 +58,7 @@ button, .button-link, input, select, textarea, dialog, [class*="card"], [class*=
 
   const recolor = css => COLOR_MAP.reduce((out, [from, to]) => out.replace(from, to), css);
 
-  async function apply() {
+  async function applyTheme() {
     const links = [...document.querySelectorAll('link[rel="stylesheet"]')]
       .filter(link => new URL(link.href, location.href).origin === location.origin);
     await Promise.all(links.map(async link => {
@@ -71,8 +76,43 @@ button, .button-link, input, select, textarea, dialog, [class*="card"], [class*=
     document.head.appendChild(extra);
   }
 
-  const done = () => veil.remove();
-  const run = () => apply().then(done, done);
+  // "Vorten D8" entry in the Оформление dialog. appearance.js only knows baseline/industrial, so the
+  // capture-phase listener keeps the "vorten" value away from it. Switching either way reloads the
+  // page: that is the simplest way to put the original stylesheets back or take them out.
+  function addPickerOption() {
+    const select = document.querySelector("#appearance-style");
+    if (!select) return;
+    const option = new Option("Vorten D8", OPTION_VALUE);
+    select.appendChild(option);
+    if (enabled) select.value = OPTION_VALUE;
+    select.addEventListener("change", event => {
+      if (select.value === OPTION_VALUE) {
+        event.stopImmediatePropagation();
+        store(KEY, "on");
+        store(STYLE_KEY, "baseline");
+      } else {
+        store(KEY, "off");  // appearance.js (next listener) saves the chosen style itself
+      }
+      setTimeout(() => location.reload(), 50);
+    }, true);
+  }
+
+  let veil = null;
+  if (enabled) {
+    // Vorten maps onto the "baseline" style only; set before appearance-init.js reads it.
+    store(STYLE_KEY, "baseline");
+    // Avoid a flash of lime while the stylesheets are being rewritten.
+    veil = document.createElement("style");
+    veil.textContent = "html{background:#0b0b0c!important}body{visibility:hidden}";
+    document.documentElement.appendChild(veil);
+  }
+
+  const run = () => {
+    addPickerOption();
+    if (!enabled) return;
+    const done = () => veil.remove();
+    applyTheme().then(done, done);
+  };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", run, { once: true });
   else run();
 })();
