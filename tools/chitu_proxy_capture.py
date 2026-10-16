@@ -2,7 +2,7 @@
 the whole conversation so it can be compared with what slm_chitu_send does.
 
 Why: CHITUBOX silently drops ~15% of the SaveFile requests slm_chitu_send
-sends it (see slm_chitu_send.py, _request_save_with_retry), yet the stock
+sends it (see chitu_send/protocol.py, _request_save_with_retry), yet the stock
 ChituManager works fine, so it must be doing something we don't. Neither
 program logs the protocol, so we watch it on the wire.
 
