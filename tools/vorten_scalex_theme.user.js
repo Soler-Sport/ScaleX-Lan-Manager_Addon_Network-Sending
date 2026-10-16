@@ -30,11 +30,12 @@
   const enabled = readEnabled();
 
   const COLOR_MAP = [
-    [/rgba\(\s*232\s*,\s*255\s*,\s*101/gi, "rgba(255,77,77"],  // accent tints
+    [/rgba\(\s*(?:232\s*,\s*255\s*,\s*101|214\s*,\s*255\s*,\s*66|221\s*,\s*255\s*,\s*65)/gi, "rgba(255,77,77"],  // accent tints (warehouse uses two more limes)
     [/#e8ff65/gi, "#ff4d4d"],  // accent
     [/#12140c/gi, "#140a0a"],  // text on accent
     [/#242a0a/gi, "#2a1010"],  // accent-dark
     [/#dce9a4/gi, "#ffb0b0"],  // light accent text
+    [/#dff769/gi, "#ff8a8a"],  // "known" warehouse status text
     [/#202622/gi, "#141415"],  // body gradient highlight
     [/#111315/gi, "#0b0b0c"],  // bg
     [/#1a1d20/gi, "#141415"],  // panel
@@ -54,7 +55,7 @@
   --text: #ececec; --muted: #8e8e93; --accent: #ff4d4d; --accent-dark: #2a1010;
 }
 body, button, input, select, textarea { font-family: var(--vt-font) !important; }
-button, .button-link, input, select, textarea, dialog, [class*="card"], [class*="panel"] { border-radius: 2px !important; }`;
+button, .button-link, a[class*="button"], input, select, textarea, dialog, [class*="card"], [class*="panel"] { border-radius: 2px !important; }`;
 
   const recolor = css => COLOR_MAP.reduce((out, [from, to]) => out.replace(from, to), css);
 

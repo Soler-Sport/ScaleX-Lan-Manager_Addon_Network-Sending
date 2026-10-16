@@ -1,0 +1,130 @@
+/*
+ * Vorten D8 for ScaleX LAN Manager (baseline style). Generated from the baseline sheets:
+ * the :root variables are overridden first, then every rule that hard-codes a ScaleX color is repeated recolored.
+ * Load it AFTER the page's own stylesheets (Stylus "UserCSS" / user style does this).
+ */
+:root {
+  --bg: #0b0b0c; --panel: #141415; --panel-2: #1c1c1e; --line: #2c2c2e;
+  --text: #ececec; --muted: #8e8e93; --accent: #ff4d4d; --accent-dark: #2a1010;
+  --vt-font: "Space Mono", "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+body, button, input, select, textarea { font-family: var(--vt-font) !important; }
+button, .button-link, a[class*="button"], input, select, textarea, dialog, [class*="card"], [class*="panel"] { border-radius: 2px !important; }
+
+/* styles.css */
+:root {
+  color-scheme: dark;
+  --bg: #0b0b0c;
+  --panel: #141415;
+  --panel-2: #1c1c1e;
+  --line: #2c2c2e;
+  --text: #ececec;
+  --muted: #8e8e93;
+  --accent: #ff4d4d;
+  --accent-dark: #2a1010;
+  --green: #73d49a;
+  --red: #ff7e78;
+}
+body {
+  margin: 0;
+  background: radial-gradient(circle at 90% 0, #141415 0, var(--bg) 34rem);
+  color: var(--text);
+  font-family: "Segoe UI", Arial, sans-serif;
+}
+.safe-start-toggle:has(input:checked) { border-color: var(--accent); background: rgba(255,77,77, .09); color: var(--accent); }
+.primary { border-color: var(--accent); background: var(--accent); color: #140a0a; font-weight: 700; }
+.primary:disabled { border-color: var(--line); background: #26262a; color: var(--muted); }
+.bulk-upload-open { display: grid; width: 100%; min-height: 112px; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 18px; margin: 0 0 20px; padding: 20px 24px; border: 2px dashed rgba(255,77,77, .66); border-radius: 14px; background: linear-gradient(135deg, rgba(255,77,77, .09), rgba(21, 24, 26, .96)); color: var(--accent); text-align: left; }
+.bulk-upload-icon { display: grid; width: 54px; height: 54px; place-items: center; border: 1px solid rgba(255,77,77, .48); border-radius: 13px; background: rgba(255,77,77, .1); color: var(--accent) !important; font-size: 29px !important; font-weight: 800 !important; }
+.bulk-upload-cta { padding: 10px 14px; border: 1px solid rgba(255,77,77, .6); border-radius: 9px; background: var(--accent); color: #140a0a !important; font-size: 12px !important; font-weight: 800 !important; white-space: nowrap; }
+.bulk-upload-open:hover, .bulk-upload-open.drag-over { border-style: solid; border-color: var(--accent); background: linear-gradient(135deg, rgba(255,77,77, .16), rgba(21, 24, 26, .96)); box-shadow: 0 0 26px rgba(255,77,77, .13); }
+.summary-filter:hover { border-color: rgba(255,77,77, .55); color: var(--text); }
+.summary-filter.active { border-color: var(--accent); background: var(--accent); color: #140a0a; font-weight: 800; }
+.view-mode-switch { display: inline-flex; flex: 0 0 auto; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: #0b0b0c; }
+.view-mode-button.active { background: var(--accent); color: #140a0a; font-weight: 700; }
+.storage-index-meta span { padding: 6px 9px; border: 1px solid var(--line); border-radius: 999px; background: #141415; }
+.storage-search-selection { display: flex; align-items: center; gap: 12px; margin-top: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.storage-search-result { display: grid; grid-template-columns: auto minmax(150px, .8fr) minmax(210px, 1.25fr) auto; align-items: center; gap: 12px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.upload-list-item { display: grid; grid-template-columns: minmax(150px, 1.2fr) minmax(160px, 2fr) minmax(120px, 1fr) auto auto; align-items: center; gap: 12px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.printer-card.printer-printing { border-color: rgba(255,77,77, .76); box-shadow: 0 0 0 1px rgba(255,77,77, .1), 0 10px 28px rgba(155, 177, 38, .08); }
+.printer-card.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(255,77,77, .2), 0 15px 40px rgba(0, 0, 0, .28); transform: translateY(-2px); }
+.printer-actions-toggle { display: inline-grid; width: 24px; height: 24px; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 7px; background: #141415; color: var(--muted); font-size: 13px; line-height: 1; }
+.printer-actions-menu { position: absolute; z-index: 20; top: 30px; left: 0; display: grid; min-width: 210px; gap: 4px; padding: 7px; border: 1px solid var(--line); border-radius: 9px; background: #0b0b0c; box-shadow: 0 14px 35px rgba(0, 0, 0, .38); }
+.copy-ip-button, .printer-details-toggle { display: inline-grid; width: 21px; height: 21px; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: #141415; color: var(--muted); font-size: 11px; line-height: 1; }
+.printer-details-menu { position: absolute; z-index: 20; top: 27px; right: 0; left: auto; display: grid; width: min(270px, calc(100vw - 32px)); gap: 7px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #0b0b0c; box-shadow: 0 14px 35px rgba(0, 0, 0, .38); }
+.status { display: inline-flex; max-width: 100%; align-items: center; justify-content: center; gap: 7px; height: fit-content; padding: 6px 9px; border-radius: 99px; background: #26262a; font-size: 12px; text-align: center; white-space: normal; overflow-wrap: anywhere; }
+.status.waiting { border: 1px solid rgba(255,77,77, .5); color: var(--accent); }
+article[data-printing="true"] .file-metric:hover,
+article[data-printing="true"] .layer-metric:hover,
+article[data-printing="true"] .progress:hover,
+.current-print-preview.current-job-open:hover { border-color: rgba(255,77,77, .55); background: #1b2022; }
+.ping-warning { border-color: rgba(255,77,77, .48); }
+.film-metric.film-warning { border-color: rgba(255,77,77, .55); }
+.bulk-file-picker { display: grid; min-height: 92px; place-content: center; gap: 6px; margin: 14px 0; padding: 18px; border: 2px dashed var(--line); border-radius: 11px; background: #141415; text-align: center; cursor: pointer; }
+.bulk-file-picker:hover, .bulk-file-picker.drag-over { border-color: var(--accent); background: rgba(255,77,77, .07); }
+.bulk-printer-option { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px 12px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.bulk-printer-option:has(.bulk-printer-select:checked) { border-color: rgba(255,77,77, .65); background: rgba(255,77,77, .06); }
+.bulk-ctb-preview { display: grid; gap: 10px; margin: 0 0 12px; padding: 12px; border: 1px solid rgba(255,77,77,.28); border-radius: 9px; background: rgba(255,77,77,.045); }
+.ctb-mode-switch input:checked + span { border-color: rgba(255,77,77, .72); background: rgba(255,77,77, .18); }
+.bulk-upload-status { display: grid; gap: 7px; margin-top: 14px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.card-upload { margin: 0 0 14px; padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.current-print-preview { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; margin: 12px 0 14px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.safe-start-camera-frame { display: grid; min-height: 360px; place-items: center; overflow: hidden; border: 2px solid rgba(255,77,77, .45); border-radius: 12px; background: #090a0b; }
+.safe-start-hint { margin: 12px 0 0; padding: 10px 12px; border-left: 3px solid var(--accent); background: rgba(255,77,77, .06); color: var(--text); font-size: 13px; }
+.current-job-row { min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.z-axis-control { margin-top: 16px; padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: #141415; }
+.z-axis-step { border-color: var(--line); background: #0b0b0c; color: var(--muted); }
+.printer-settings-summary div, .printer-settings-section { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.printer-files-bulk-actions { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.printer-file-item { position: relative; display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.printer-file-item.highlighted-file { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(255,77,77, .28); }
+.stored-file-warehouse-status.is-known > span { color: #ff8a8a; font-weight: 700; }
+input, select, textarea { width: 100%; margin-top: 7px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #0b0b0c; color: var(--text); }
+.notice { padding: 12px; border-left: 3px solid var(--accent); background: var(--accent-dark); color: #ffb0b0; font-size: 13px; line-height: 1.5; }
+.discovery-summary { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: #141415; color: var(--muted); font-size: 13px; }
+.upload-status { margin-top: 14px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.upload-other-printer { margin-bottom: 12px; padding: 10px 12px; border: 1px solid rgba(255,77,77, .4); border-radius: 8px; background: var(--accent-dark); color: #ffb0b0; font-size: 12px; }
+.upload-file-confirmation { display: grid; gap: 4px; margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.ctb-params-panel { display: grid; gap: 12px; margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: #141415; }
+.discovery-device { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #141415; }
+.history-tabs { display: inline-flex; gap: 4px; margin-bottom: 16px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: #0b0b0c; }
+#timeline-state.compact { min-height: 0; margin-bottom: 10px; padding: 9px 14px; border-style: solid; background: rgba(255,77,77, .04); }
+.history-row:hover, .history-row:focus { outline: none; background: rgba(255,77,77, .055); }
+.status-printing, .reconcile-pending, .reconcile-waiting, .job-queued, .job-waiting, .job-running { border-color: rgba(255,77,77, .5); background: rgba(255,77,77, .08); color: var(--accent); }
+.history-detail-section { padding: 16px; border: 1px solid var(--line); border-radius: 11px; background: #141415; }
+.timeline-period-switch button.active { border-color: rgba(255,77,77, .55); background: rgba(255,77,77, .12); color: var(--accent); }
+.timeline-shift-card.total { background: linear-gradient(135deg, rgba(255,77,77,.07), transparent 65%), var(--panel); }
+.timeline-frame { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: #0b0b0c; }
+.timeline-scroll { max-height: calc(100vh - 310px); overflow: auto; background: #0b0b0c; }
+.timeline-axis { position: sticky; z-index: 8; top: 0; min-height: 40px; border-bottom: 1px solid var(--line); background: #141415; }
+.timeline-axis-label, .timeline-printer { position: sticky; z-index: 7; left: 0; padding: 11px 13px; border-right: 1px solid var(--line); background: #141415; }
+.timeline-block.printing { border-color: var(--accent); background: rgba(255,77,77, .9); }
+.timeline-block.unknown { border-color: #8d97a2; background: rgba(141, 151, 162, .82); color: #0b0b0c; }
+.timeline-block.visual-unconfirmed, .timeline-block.unknown.visual-active, .timeline-block.unknown.visual-unreviewed { border-color: #8d97a2; background-color: rgba(141, 151, 162, .82); color: #0b0b0c; }
+.timeline-block.search-match { z-index: 4; border-color: #fff; box-shadow: 0 0 0 2px rgba(255,77,77,.7), 0 0 16px rgba(255,77,77,.55); filter: saturate(1.25) brightness(1.08); }
+.mobile-screening-printer.scanner-target { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255,77,77,.2); animation: scanner-target-pulse .7s ease 2; }
+html[data-ui-mode="mobile"] .mobile-work-mode button.active { border-color: var(--accent); background: rgba(255,77,77, .13); color: var(--accent); }
+html[data-ui-mode="mobile"] .printer-card.mobile-collapsed .mobile-film-counter.warning { border-color: rgba(255,77,77, .55); color: var(--accent); }
+.warehouse-list-item[open] > .warehouse-list-row { background: rgba(255,77,77, .045); }
+.warehouse-source-folder-button:hover { border-color: var(--accent); background: rgba(255,77,77, .08); }
+.warehouse-print-ctb-button { display: inline-grid; flex: 0 0 28px; width: 28px; height: 28px; padding: 5px; place-items: center; border: 1px solid rgba(255,77,77, .35); border-radius: 7px; background: rgba(255,77,77, .07); color: var(--accent); cursor: pointer; }
+.warehouse-print-ctb-button:hover { border-color: var(--accent); background: rgba(255,77,77, .15); }
+#warehouse-thumbnail-hover-preview { position: fixed; z-index: 10000; display: none; width: var(--warehouse-preview-size, 320px); height: var(--warehouse-preview-size, 320px); overflow: hidden; pointer-events: none; border: 1px solid rgba(255,77,77, .42); border-radius: 12px; background: #050709; box-shadow: 0 18px 52px rgba(0, 0, 0, .72); }
+#warehouse-component-tooltip { position: fixed; z-index: 10001; display: none; width: max-content; max-width: min(360px, calc(100vw - 24px)); padding: 8px 10px; border: 1px solid rgba(255,77,77, .4); border-radius: 8px; background: #111618; box-shadow: 0 12px 32px rgba(0, 0, 0, .62); color: var(--text); font-size: .72rem; font-weight: 600; line-height: 1.4; pointer-events: none; }
+.warehouse-order-attachment-dropzone:hover, .warehouse-order-attachment-dropzone.is-over { border-color: var(--accent); background: rgba(255,77,77,.055); }
+.warehouse-recipe-dropzone { display: grid; justify-items: center; gap: 4px; padding: 17px 14px; border: 1px dashed rgba(255,77,77, .45); border-radius: 12px; background: rgba(255,77,77, .045); color: var(--text); text-align: center; cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+.warehouse-recipe-dropzone:hover, .warehouse-recipe-dropzone:focus-visible, .warehouse-recipe-dropzone.is-dragging { border-color: var(--accent); background: rgba(255,77,77, .12); outline: 0; }
+.warehouse-recipe-row.is-pending { border-color: rgba(255,77,77, .28); }
+.warehouse-recipe-row.is-dragging { border-color: var(--accent); background: rgba(255,77,77, .1); }
+.warehouse-recipe-row .warehouse-recipe-row-drop-hint { color: rgba(255,77,77, .72); }
+.warehouse-ctb-profile { display: grid; gap: 10px; padding: 13px; border: 1px solid rgba(255,77,77, .24); border-radius: 11px; background: rgba(255,77,77, .035); }
+.warehouse-ctb-composition-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 3px; border-top: 1px solid rgba(255,77,77, .15); }
+
+/* printer-card-layout.css */
+
+
+/* scroll-navigation.css */
+
+
+/* mobile-appearance.css */
+
