@@ -1,9 +1,11 @@
+import ctypes
 import json
 import os
 import re
 import threading
+import traceback
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget
 
 from .composition import _composition_item_label, match_composition_components, read_chitu_hook_model_names, suggest_composition_matches
 from .ctb_file import extract_ctb_machine_name
@@ -26,6 +28,7 @@ class PickerWindow(QMainWindow):
     _printers_signal = Signal(list, str)           # printers, error message ("" if ok)
     _retry_signal = Signal(list)                   # targets(list[dict]) - one row's own retry, not the whole-batch state
     _composition_signal = Signal(list, str)        # warehouse components, error message ("" if ok)
+    closed = Signal(object)                        # emitted from closeEvent - PickerHost drops this window's tab
 
     def __init__(self, file_path, filename, machine_name, chitubox_conn=None):
         super().__init__()
@@ -56,8 +59,12 @@ class PickerWindow(QMainWindow):
         self.composition_unmatched = []  # list[str] - model names with no exact code match
         self.composition_choice_combos = {}  # model_name -> QComboBox, one per ambiguous group (operator's article pick)
         self.rows = {}       # printer_id -> PrinterRowWidget
-        self.sending = False
         self._loaded_once = False
+        # 2026-10-16: several sends may be in flight from one window (the operator
+        # can pick more printers while earlier ones are still uploading) - each
+        # row remembers the settings of the batch that locked it, for its own retry.
+        self._row_params = {}                # printer_id -> (display_name, start_print, test_print)
+        self._composition_saved_names = set()  # file names whose composition was already saved from this window
         self._last_display_name = None  # set by _on_send_clicked, reused by a single-row retry
         self._last_start_print = False
         self._last_test_print = False
@@ -203,7 +210,7 @@ class PickerWindow(QMainWindow):
 
         actions_row = QHBoxLayout()
         actions_row.addStretch(1)
-        self.close_btn = QPushButton("Закрыть окно")
+        self.close_btn = QPushButton("Закрыть")
         self.close_btn.clicked.connect(self.close)
         self.close_btn.setVisible(False)
         # Two explicit buttons instead of a "start print" checkbox modifying
@@ -434,8 +441,6 @@ class PickerWindow(QMainWindow):
 
     # -- filtering/rendering -------------------------------------------------
     def _render_list(self):
-        if self.sending:
-            return
         query = self.search_edit.text().strip().lower()
         online_only = self.online_only_cb.isChecked()
         hide_busy = self.hide_busy_cb.isChecked()
@@ -469,7 +474,9 @@ class PickerWindow(QMainWindow):
         ordered = sorted(self.rows.values(),
                           key=lambda r: (r.printer.get("displayName") or r.printer.get("name") or "").lower())
         for row in ordered:
-            visible = row.matches_filters(query, online_only, hide_busy, match_only, self.machine_name)
+            # A row that is sending (or shows a result/error) stays on screen whatever the
+            # filters say - uploading flips its printer to "busy", which would hide it.
+            visible = row.has_progress_shown() or row.matches_filters(query, online_only, hide_busy, match_only, self.machine_name)
             row.setVisible(visible)
             if visible:
                 self.list_layout.insertWidget(self.list_layout.count() - 1, row)
@@ -477,25 +484,27 @@ class PickerWindow(QMainWindow):
 
     def _select_all_visible(self):
         for row in self.rows.values():
-            if row.isVisible():
+            if row.isVisible() and row.checkbox.isEnabled():
                 row.checkbox.setChecked(True)
 
     def _clear_all(self):
         for row in self.rows.values():
-            row.checkbox.setChecked(False)
+            if row.checkbox.isEnabled():
+                row.checkbox.setChecked(False)
 
     def _update_selected_count(self):
-        n = sum(1 for row in self.rows.values() if row.checkbox.isChecked())
+        # a locked row (already sending / sent) keeps its checkbox checked but disabled - not selectable again
+        n = sum(1 for row in self.rows.values() if row.checkbox.isChecked() and row.checkbox.isEnabled())
         self.selected_count_label.setText("Выбрано: %d" % n)
-        self.send_btn.setEnabled(n > 0 and not self.sending)
-        self.send_and_start_btn.setEnabled(n > 0 and not self.sending)
+        self.send_btn.setEnabled(n > 0)
+        self.send_and_start_btn.setEnabled(n > 0)
 
     # -- sending --------------------------------------------------------------
     def _on_send_clicked(self, start_print):
         selected_ids = set()
         targets = []
         for pid, row in self.rows.items():
-            if not row.checkbox.isChecked():
+            if not row.checkbox.isChecked() or not row.checkbox.isEnabled():
                 continue
             selected_ids.add(pid)
             apply_rec = row.rec_row.isVisible() and row.rec_checkbox.isChecked()
@@ -507,27 +516,19 @@ class PickerWindow(QMainWindow):
         src_ext = os.path.splitext(self.filename)[1]
         if src_ext and not display_name.lower().endswith(src_ext.lower()):
             display_name += src_ext
-        self._last_display_name = display_name  # reused by a later single-row retry
-        self._last_start_print = start_print
         test_print = self.test_print_cb.isChecked()
-        self._last_test_print = test_print
-        self.test_print_cb.setEnabled(False)  # locked for the send, like the other inputs
-        self._save_composition_in_background(display_name)
+        # The same name is saved once per window: a second batch of the same file to
+        # other printers must not re-PUT the (replace-style) composition.
+        if not test_print and display_name not in self._composition_saved_names:
+            self._composition_saved_names.add(display_name)
+            self._save_composition_in_background(display_name)
+        for pid in selected_ids:
+            self._row_params[pid] = (display_name, start_print, test_print)
 
-        self.sending = True
-        self._refresh_timer.stop()
-        self.filename_edit.setEnabled(False)
-        self.search_edit.setEnabled(False)
-        self.online_only_cb.setEnabled(False)
-        self.hide_busy_cb.setEnabled(False)
-        self.match_only_cb.setEnabled(False)
-        self.send_and_start_btn.setEnabled(False)
-        self.send_btn.setEnabled(False)
-        for w in (self.machine_notice,):
-            pass  # left visible, harmless
-
-        for pid, row in self.rows.items():
-            selected = pid in selected_ids
+        # The form stays usable: only the rows in this batch are locked, so more
+        # printers can be picked and sent while these are still uploading.
+        for pid in selected_ids:
+            row = self.rows[pid]
             # 2026-09-30 (user report: sending to an already-printing
             # printer visually "squished its card into another one"): a row
             # checked before its printer went busy (with "Скрывать занятые"
@@ -539,9 +540,10 @@ class PickerWindow(QMainWindow):
             # position - overlapping whatever row IS actually laid out
             # there. Only ever needed for a selected row that fell out of
             # the list this way; every already-laid-out row is a no-op here.
-            if selected and self.list_layout.indexOf(row) == -1:
+            if self.list_layout.indexOf(row) == -1:
                 self.list_layout.insertWidget(self.list_layout.count() - 1, row)
-            row.set_locked_for_send(selected)
+            row.set_locked_for_send(True)
+        self._update_selected_count()
 
         logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s) ===",
                self.filename, display_name, json.dumps(targets), start_print)
@@ -580,13 +582,6 @@ class PickerWindow(QMainWindow):
             row = self.rows.get(str(t["printerId"]))
             if row:
                 row.unlock_after_send(succeeded=(t["phase"] != "error"))
-        self.sending = False
-        self.filename_edit.setEnabled(True)
-        self.search_edit.setEnabled(True)
-        self.online_only_cb.setEnabled(True)
-        self.hide_busy_cb.setEnabled(True)
-        self.match_only_cb.setEnabled(True)
-        self._refresh_timer.start()
         self._render_list()
         self._update_selected_count()
 
@@ -606,8 +601,8 @@ class PickerWindow(QMainWindow):
             return
         apply_rec = row.rec_row.isVisible() and row.rec_checkbox.isChecked()
         target = {"printerId": pid, "applyRecommendations": apply_rec}
-        display_name = self._last_display_name or self.filename
-        start_print = self._last_start_print
+        display_name, start_print, test_print = self._row_params.get(
+            pid, (self._last_display_name or self.filename, self._last_start_print, self._last_test_print))
 
         row.set_locked_for_send(True)
         logmsg("=== PICKER: retrying %s -> %s (startPrint=%s) ===", self.filename, pid, start_print)
@@ -617,7 +612,7 @@ class PickerWindow(QMainWindow):
 
         send_in_background(self.file_path, [target], display_name=display_name,
                             start_print=start_print, report_cb=report_cb,
-                            test_print=self._last_test_print)
+                            test_print=test_print)
 
     def _on_retry_progress(self, targets_out):
         for t in targets_out:
@@ -688,6 +683,7 @@ class PickerWindow(QMainWindow):
 
                 threading.Thread(target=_notify, daemon=True).start()
         super().closeEvent(event)
+        self.closed.emit(self)
 
 
 _open_windows = []  # keeps PickerWindow instances alive - Qt doesn't hold a Python reference on its own
@@ -732,6 +728,116 @@ def open_picker_window(dest_path, chitubox_conn=None):
     logmsg("=== OPENING PICKER: %s (machine=%r, %d other picker window(s) already open) ===",
            filename, machine_name, len(_open_windows))
     win = PickerWindow(dest_path, filename, machine_name, chitubox_conn=chitubox_conn)
-    win.show()
-    force_window_to_foreground(win)
     _open_windows.append(win)
+    _get_host().add_picker(win)
+
+
+class PickerHost(QMainWindow):
+    """The single top-level window every PickerWindow lives in, one tab per
+    captured file (2026-10-15: sending a batch of plates used to open one
+    top-level window each - ten entries in Alt-Tab/the taskbar). The host
+    shows itself when the first tab arrives and hides when the last one is
+    gone; closing the host closes every tab through the normal
+    PickerWindow.closeEvent, so the CHITUBOX close-notify logic is unchanged."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Network sending")
+        self.resize(780, 860)
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(False)  # own close buttons, see add_picker - the stock ones are unthemeable
+        self.tabs.setDocumentMode(True)
+        self.tabs.setElideMode(Qt.ElideMiddle)
+        self.tabs.setUsesScrollButtons(True)
+        self.setCentralWidget(self.tabs)
+        # 2026-10-16: seen live - the host window sat hidden (Windows' IsWindowVisible
+        # False) with three tabs still in it, so the operator never saw the picker
+        # even though captures kept arriving. Cause not pinned down (never
+        # reproduced in a fresh process); this re-shows it and logs the evidence.
+        self._visibility_timer = QTimer(self)
+        self._visibility_timer.setInterval(1500)
+        self._visibility_timer.timeout.connect(self._ensure_visible)
+        self._visibility_timer.start()
+
+    def add_picker(self, win):
+        win.closed.connect(self._on_picker_closed)
+        idx = self.tabs.addTab(win, win.filename)
+        self.tabs.setTabToolTip(idx, win.filename)
+        close_btn = QToolButton()
+        close_btn.setObjectName("tabClose")
+        close_btn.setText("✕")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip("Закрыть")
+        close_btn.clicked.connect(lambda _=False, b=close_btn: self._close_tab_of_button(b))
+        self.tabs.tabBar().setTabButton(idx, QTabBar.RightSide, close_btn)
+        self.tabs.setCurrentIndex(idx)
+        self._update_title()
+        self.show()
+        self.raise_()
+        force_window_to_foreground(self)
+
+    def _close_tab_of_button(self, button):
+        bar = self.tabs.tabBar()
+        for i in range(self.tabs.count()):
+            if bar.tabButton(i, QTabBar.RightSide) is button:
+                self._close_tab(i)
+                return
+
+    def _close_tab(self, index):
+        win = self.tabs.widget(index)
+        if win is not None:
+            win.close()  # closeEvent -> closed signal -> _on_picker_closed removes the tab
+
+    def _on_picker_closed(self, win):
+        idx = self.tabs.indexOf(win)
+        if idx >= 0:
+            self.tabs.removeTab(idx)
+            win.setParent(None)
+        self._update_title()
+        if self.tabs.count() == 0:
+            self.hide()
+
+    def _natively_visible(self):
+        try:
+            return bool(ctypes.windll.user32.IsWindowVisible(int(self.winId())))
+        except Exception:
+            return True  # can't tell - don't second-guess Qt
+
+    def _ensure_visible(self):
+        if self.tabs.count() == 0 or self.isMinimized():
+            return
+        if not self.isVisible() or not self._natively_visible():
+            logmsg("=== PickerHost was hidden with %d tab(s) open (qt visible=%s, native visible=%s) - showing it again ===",
+                   self.tabs.count(), self.isVisible(), self._natively_visible())
+            self.show()
+            self.raise_()
+            force_window_to_foreground(self)
+
+    def hideEvent(self, event):
+        if self.tabs.count() > 0:
+            logmsg("=== PickerHost.hideEvent with %d tab(s) open; stack: %s ===",
+                   self.tabs.count(), "".join(traceback.format_stack(limit=10)))
+        super().hideEvent(event)
+
+    def _update_title(self):
+        n = self.tabs.count()
+        self.setWindowTitle("Network sending" if n <= 1 else "Network sending — %d плит(ы)" % n)
+
+    def closeEvent(self, event):
+        # No confirmation: a send already handed to the background uploader keeps
+        # going after its tab is closed, so closing the window loses nothing.
+        for i in reversed(range(self.tabs.count())):
+            win = self.tabs.widget(i)
+            if win is not None:
+                win.close()
+        super().closeEvent(event)
+
+
+_host = None  # the one PickerHost, created on first use (needs a QApplication)
+
+
+def _get_host():
+    global _host
+    if _host is None:
+        _host = PickerHost()
+    return _host

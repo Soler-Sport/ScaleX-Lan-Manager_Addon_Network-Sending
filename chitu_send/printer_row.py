@@ -227,6 +227,11 @@ class PrinterRowWidget(QFrame):
                 return False
         return True
 
+    def has_progress_shown(self):
+        """True while the row shows a send's progress/result/error - such a row must
+        stay on screen regardless of the list filters."""
+        return self.mini_progress_widget.isVisibleTo(self)
+
     def set_locked_for_send(self, selected):
         """Called once when a send starts: hides unselected cards, disables
         inputs on the selected ones, and reveals their mini progress bar -

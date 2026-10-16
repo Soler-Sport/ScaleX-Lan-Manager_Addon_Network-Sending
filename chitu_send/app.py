@@ -3,6 +3,7 @@ import os
 import socket
 import sys
 import threading
+import traceback
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -16,13 +17,28 @@ from .logs import logmsg
 from .picker import open_picker_window
 from .protocol import _chitubox_accept_loop
 from .shm import SHM_NAME, create_shared_memory
-from .theme import PICKER_QSS
+from .theme import apply_theme
 from .tray import _make_tray_icon, build_tray_icon, show_waiting_notice
 from .watchdog import _start_hang_watchdog
 from .watchers import _pending_dir_watcher, slicer_file_watcher
 
 
+def _install_exception_logging():
+    """pythonw has no stderr, so an exception in a Qt slot or a worker thread
+    used to vanish without a trace - route both hooks into the log."""
+    def _log_uncaught(exc_type, exc, tb):
+        logmsg("=== UNCAUGHT EXCEPTION ===\n%s", "".join(traceback.format_exception(exc_type, exc, tb)))
+
+    def _log_thread_uncaught(args):
+        logmsg("=== UNCAUGHT EXCEPTION in thread %s ===\n%s", args.thread.name if args.thread else "?",
+               "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_thread_uncaught
+
+
 def main():
+    _install_exception_logging()
     logmsg("=== slm_chitu_send started PID=%d ===", os.getpid())
     logmsg("=== ScaleX: http://%s:%d ===", config.SCALEX_HOST, config.SCALEX_PORT)
 
@@ -43,7 +59,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # tray-resident: closing every picker window must not exit the app
-    app.setStyleSheet(PICKER_QSS)
+    apply_theme(app)  # ScaleX "Vorten" look: font chain + stylesheet
     app.setWindowIcon(_make_tray_icon())  # every PickerWindow inherits this (taskbar/Alt-Tab), not just the tray
 
     app_controller.controller = AppController()
