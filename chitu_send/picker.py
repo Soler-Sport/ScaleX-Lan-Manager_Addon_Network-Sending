@@ -59,8 +59,12 @@ class PickerWindow(QMainWindow):
         self.composition_unmatched = []  # list[str] - model names with no exact code match
         self.composition_choice_combos = {}  # model_name -> QComboBox, one per ambiguous group (operator's article pick)
         self.rows = {}       # printer_id -> PrinterRowWidget
-        self.sending = False
         self._loaded_once = False
+        # 2026-10-16: several sends may be in flight from one window (the operator
+        # can pick more printers while earlier ones are still uploading) - each
+        # row remembers the settings of the batch that locked it, for its own retry.
+        self._row_params = {}                # printer_id -> (display_name, start_print, test_print)
+        self._composition_saved_names = set()  # file names whose composition was already saved from this window
         self._last_display_name = None  # set by _on_send_clicked, reused by a single-row retry
         self._last_start_print = False
         self._last_test_print = False
@@ -437,8 +441,6 @@ class PickerWindow(QMainWindow):
 
     # -- filtering/rendering -------------------------------------------------
     def _render_list(self):
-        if self.sending:
-            return
         query = self.search_edit.text().strip().lower()
         online_only = self.online_only_cb.isChecked()
         hide_busy = self.hide_busy_cb.isChecked()
@@ -472,7 +474,9 @@ class PickerWindow(QMainWindow):
         ordered = sorted(self.rows.values(),
                           key=lambda r: (r.printer.get("displayName") or r.printer.get("name") or "").lower())
         for row in ordered:
-            visible = row.matches_filters(query, online_only, hide_busy, match_only, self.machine_name)
+            # A row that is sending (or shows a result/error) stays on screen whatever the
+            # filters say - uploading flips its printer to "busy", which would hide it.
+            visible = row.has_progress_shown() or row.matches_filters(query, online_only, hide_busy, match_only, self.machine_name)
             row.setVisible(visible)
             if visible:
                 self.list_layout.insertWidget(self.list_layout.count() - 1, row)
@@ -480,25 +484,27 @@ class PickerWindow(QMainWindow):
 
     def _select_all_visible(self):
         for row in self.rows.values():
-            if row.isVisible():
+            if row.isVisible() and row.checkbox.isEnabled():
                 row.checkbox.setChecked(True)
 
     def _clear_all(self):
         for row in self.rows.values():
-            row.checkbox.setChecked(False)
+            if row.checkbox.isEnabled():
+                row.checkbox.setChecked(False)
 
     def _update_selected_count(self):
-        n = sum(1 for row in self.rows.values() if row.checkbox.isChecked())
+        # a locked row (already sending / sent) keeps its checkbox checked but disabled - not selectable again
+        n = sum(1 for row in self.rows.values() if row.checkbox.isChecked() and row.checkbox.isEnabled())
         self.selected_count_label.setText("Выбрано: %d" % n)
-        self.send_btn.setEnabled(n > 0 and not self.sending)
-        self.send_and_start_btn.setEnabled(n > 0 and not self.sending)
+        self.send_btn.setEnabled(n > 0)
+        self.send_and_start_btn.setEnabled(n > 0)
 
     # -- sending --------------------------------------------------------------
     def _on_send_clicked(self, start_print):
         selected_ids = set()
         targets = []
         for pid, row in self.rows.items():
-            if not row.checkbox.isChecked():
+            if not row.checkbox.isChecked() or not row.checkbox.isEnabled():
                 continue
             selected_ids.add(pid)
             apply_rec = row.rec_row.isVisible() and row.rec_checkbox.isChecked()
@@ -510,27 +516,19 @@ class PickerWindow(QMainWindow):
         src_ext = os.path.splitext(self.filename)[1]
         if src_ext and not display_name.lower().endswith(src_ext.lower()):
             display_name += src_ext
-        self._last_display_name = display_name  # reused by a later single-row retry
-        self._last_start_print = start_print
         test_print = self.test_print_cb.isChecked()
-        self._last_test_print = test_print
-        self.test_print_cb.setEnabled(False)  # locked for the send, like the other inputs
-        self._save_composition_in_background(display_name)
+        # The same name is saved once per window: a second batch of the same file to
+        # other printers must not re-PUT the (replace-style) composition.
+        if not test_print and display_name not in self._composition_saved_names:
+            self._composition_saved_names.add(display_name)
+            self._save_composition_in_background(display_name)
+        for pid in selected_ids:
+            self._row_params[pid] = (display_name, start_print, test_print)
 
-        self.sending = True
-        self._refresh_timer.stop()
-        self.filename_edit.setEnabled(False)
-        self.search_edit.setEnabled(False)
-        self.online_only_cb.setEnabled(False)
-        self.hide_busy_cb.setEnabled(False)
-        self.match_only_cb.setEnabled(False)
-        self.send_and_start_btn.setEnabled(False)
-        self.send_btn.setEnabled(False)
-        for w in (self.machine_notice,):
-            pass  # left visible, harmless
-
-        for pid, row in self.rows.items():
-            selected = pid in selected_ids
+        # The form stays usable: only the rows in this batch are locked, so more
+        # printers can be picked and sent while these are still uploading.
+        for pid in selected_ids:
+            row = self.rows[pid]
             # 2026-09-30 (user report: sending to an already-printing
             # printer visually "squished its card into another one"): a row
             # checked before its printer went busy (with "Скрывать занятые"
@@ -542,9 +540,10 @@ class PickerWindow(QMainWindow):
             # position - overlapping whatever row IS actually laid out
             # there. Only ever needed for a selected row that fell out of
             # the list this way; every already-laid-out row is a no-op here.
-            if selected and self.list_layout.indexOf(row) == -1:
+            if self.list_layout.indexOf(row) == -1:
                 self.list_layout.insertWidget(self.list_layout.count() - 1, row)
-            row.set_locked_for_send(selected)
+            row.set_locked_for_send(True)
+        self._update_selected_count()
 
         logmsg("=== PICKER: sending %s as \"%s\" -> %s (startPrint=%s) ===",
                self.filename, display_name, json.dumps(targets), start_print)
@@ -583,13 +582,6 @@ class PickerWindow(QMainWindow):
             row = self.rows.get(str(t["printerId"]))
             if row:
                 row.unlock_after_send(succeeded=(t["phase"] != "error"))
-        self.sending = False
-        self.filename_edit.setEnabled(True)
-        self.search_edit.setEnabled(True)
-        self.online_only_cb.setEnabled(True)
-        self.hide_busy_cb.setEnabled(True)
-        self.match_only_cb.setEnabled(True)
-        self._refresh_timer.start()
         self._render_list()
         self._update_selected_count()
 
@@ -609,8 +601,8 @@ class PickerWindow(QMainWindow):
             return
         apply_rec = row.rec_row.isVisible() and row.rec_checkbox.isChecked()
         target = {"printerId": pid, "applyRecommendations": apply_rec}
-        display_name = self._last_display_name or self.filename
-        start_print = self._last_start_print
+        display_name, start_print, test_print = self._row_params.get(
+            pid, (self._last_display_name or self.filename, self._last_start_print, self._last_test_print))
 
         row.set_locked_for_send(True)
         logmsg("=== PICKER: retrying %s -> %s (startPrint=%s) ===", self.filename, pid, start_print)
@@ -620,7 +612,7 @@ class PickerWindow(QMainWindow):
 
         send_in_background(self.file_path, [target], display_name=display_name,
                             start_print=start_print, report_cb=report_cb,
-                            test_print=self._last_test_print)
+                            test_print=test_print)
 
     def _on_retry_progress(self, targets_out):
         for t in targets_out:
