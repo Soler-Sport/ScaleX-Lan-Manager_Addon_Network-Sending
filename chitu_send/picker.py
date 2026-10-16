@@ -5,7 +5,7 @@ import re
 import threading
 import traceback
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget
 
 from .composition import _composition_item_label, match_composition_components, read_chitu_hook_model_names, suggest_composition_matches
 from .ctb_file import extract_ctb_machine_name
@@ -819,18 +819,8 @@ class PickerHost(QMainWindow):
         self.setWindowTitle("Network sending" if n <= 1 else "Network sending — %d плит(ы)" % n)
 
     def closeEvent(self, event):
-        if self.tabs.count() > 1:
-            box = QMessageBox(self)
-            box.setWindowTitle("Network sending")
-            box.setIcon(QMessageBox.NoIcon)
-            box.setText("Открыто плит: %d.\nЗакрыть все, не отправив?" % self.tabs.count())
-            close_all = box.addButton("Закрыть всё", QMessageBox.AcceptRole)
-            cancel = box.addButton("Отмена", QMessageBox.RejectRole)
-            box.setDefaultButton(cancel)
-            box.exec()
-            if box.clickedButton() is not close_all:
-                event.ignore()
-                return
+        # No confirmation: a send already handed to the background uploader keeps
+        # going after its tab is closed, so closing the window loses nothing.
         for i in reversed(range(self.tabs.count())):
             win = self.tabs.widget(i)
             if win is not None:
