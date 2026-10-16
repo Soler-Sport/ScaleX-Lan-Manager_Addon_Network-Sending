@@ -49,8 +49,7 @@
   --text: #ececec; --muted: #8e8e93; --accent: #ff4d4d; --accent-dark: #2a1010;
 }
 body, button, input, select, textarea { font-family: var(--vt-font) !important; }
-button, .button-link, input, select, textarea, dialog, [class*="card"], [class*="panel"] { border-radius: 2px !important; }
-.primary:not(:disabled) { color: #140a0a !important; }`;
+button, .button-link, input, select, textarea, dialog, [class*="card"], [class*="panel"] { border-radius: 2px !important; }`;
 
   const recolor = css => COLOR_MAP.reduce((out, [from, to]) => out.replace(from, to), css);
 
