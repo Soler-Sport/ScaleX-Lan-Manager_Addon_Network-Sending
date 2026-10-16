@@ -109,6 +109,8 @@ QScrollArea { border: none; background: transparent; }
 #retryBtn { background: transparent; color: %(red)s; border: 1px solid %(red)s;
     border-radius: 6px; padding: 2px 9px; font-size: 10.5px; font-weight: 600; }
 #retryBtn:hover { background: rgba(255, 126, 120, .12); }
+QMessageBox { background: %(bg)s; }
+QMessageBox QLabel { color: %(text)s; font-size: 13px; }
 QTabWidget::pane { border: none; background: %(bg)s; }
 QTabWidget { background: %(bg)s; }
 QTabBar { background: %(bg)s; border: none; }

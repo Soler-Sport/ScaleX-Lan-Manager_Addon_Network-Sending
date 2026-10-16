@@ -820,10 +820,15 @@ class PickerHost(QMainWindow):
 
     def closeEvent(self, event):
         if self.tabs.count() > 1:
-            answer = QMessageBox.question(
-                self, "Network sending",
-                "Закрыть окно вместе с %d плитами, не отправив их?" % self.tabs.count())
-            if answer != QMessageBox.Yes:
+            box = QMessageBox(self)
+            box.setWindowTitle("Network sending")
+            box.setIcon(QMessageBox.NoIcon)
+            box.setText("Открыто плит: %d.\nЗакрыть все, не отправив?" % self.tabs.count())
+            close_all = box.addButton("Закрыть всё", QMessageBox.AcceptRole)
+            cancel = box.addButton("Отмена", QMessageBox.RejectRole)
+            box.setDefaultButton(cancel)
+            box.exec()
+            if box.clickedButton() is not close_all:
                 event.ignore()
                 return
         for i in reversed(range(self.tabs.count())):
