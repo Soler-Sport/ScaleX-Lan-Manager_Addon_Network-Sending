@@ -5,7 +5,7 @@ import re
 import threading
 import traceback
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget
 
 from .composition import _composition_item_label, match_composition_components, read_chitu_hook_model_names, suggest_composition_matches
 from .ctb_file import extract_ctb_machine_name
@@ -745,11 +745,10 @@ class PickerHost(QMainWindow):
         self.setWindowTitle("Network sending")
         self.resize(780, 860)
         self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
+        self.tabs.setTabsClosable(False)  # own close buttons, see add_picker - the stock ones are unthemeable
         self.tabs.setDocumentMode(True)
         self.tabs.setElideMode(Qt.ElideMiddle)
         self.tabs.setUsesScrollButtons(True)
-        self.tabs.tabCloseRequested.connect(self._close_tab)
         self.setCentralWidget(self.tabs)
         # 2026-10-16: seen live - the host window sat hidden (Windows' IsWindowVisible
         # False) with three tabs still in it, so the operator never saw the picker
@@ -764,11 +763,25 @@ class PickerHost(QMainWindow):
         win.closed.connect(self._on_picker_closed)
         idx = self.tabs.addTab(win, win.filename)
         self.tabs.setTabToolTip(idx, win.filename)
+        close_btn = QToolButton()
+        close_btn.setObjectName("tabClose")
+        close_btn.setText("✕")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip("Закрыть")
+        close_btn.clicked.connect(lambda _=False, b=close_btn: self._close_tab_of_button(b))
+        self.tabs.tabBar().setTabButton(idx, QTabBar.RightSide, close_btn)
         self.tabs.setCurrentIndex(idx)
         self._update_title()
         self.show()
         self.raise_()
         force_window_to_foreground(self)
+
+    def _close_tab_of_button(self, button):
+        bar = self.tabs.tabBar()
+        for i in range(self.tabs.count()):
+            if bar.tabButton(i, QTabBar.RightSide) is button:
+                self._close_tab(i)
+                return
 
     def _close_tab(self, index):
         win = self.tabs.widget(index)

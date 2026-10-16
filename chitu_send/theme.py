@@ -112,11 +112,11 @@ QScrollArea { border: none; background: transparent; }
 QTabWidget::pane { border: none; background: %(bg)s; }
 QTabWidget { background: %(bg)s; }
 QTabBar { background: %(bg)s; border: none; }
-QTabBar QToolButton { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 6px; }
-QTabBar::tab { background: %(panel2)s; color: %(dim)s; border: 1px solid %(line)s; border-bottom: none;
+QTabBar::tab { background: %(panel)s; color: %(dim)s; border: 1px solid %(line)s; border-bottom: none;
     border-top-left-radius: 8px; border-top-right-radius: 8px; padding: 7px 28px 7px 12px; margin-right: 2px; max-width: 210px; }
-QTabBar::close-button { subcontrol-origin: padding; subcontrol-position: right; margin-right: 8px; }
-QTabBar::tab:selected { background: %(panel)s; color: %(text)s; border-color: rgba(232, 255, 101, .65); }
+QTabBar::tab:selected { background: %(panel2)s; color: %(text)s; border: 1px solid %(line)s; border-top: 2px solid %(accent)s; }
+#tabClose { background: transparent; border: none; border-radius: 4px; color: %(dim)s; font-size: 11px; padding: 2px 5px; }
+#tabClose:hover { background: rgba(255, 126, 120, .2); color: %(red)s; }
 QTabBar::tab:hover { color: %(text)s; }
 QProgressBar { background: %(panel2)s; border: 1px solid %(line)s; border-radius: 5px;
     max-height: 8px; min-height: 8px; text-align: center; color: transparent; }
