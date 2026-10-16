@@ -72,6 +72,55 @@ def _inject_goo_hook(pid, dll_path):
         kernel32.CloseHandle(hProcess)
 
 
+# 2026-10-16: CHITUBOX Pro (Themida-protected) kept dying with fast-fail 0xC0000409
+# (always at the same address) 1-5 s after goo_hook.dll was injected into a process
+# that had just started - the "doesn't start on the first try" report; the retry
+# survived whenever the injection happened to land later. The hook is only needed
+# when a slice is saved, minutes after launch, so wait until the process is old
+# enough to have finished its own start-up before touching it.
+INJECT_MIN_PROCESS_AGE_SEC = 30.0
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+kernel32.GetProcessTimes.restype = wintypes.BOOL
+kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+kernel32.GetSystemTimeAsFileTime.argtypes = [ctypes.POINTER(wintypes.FILETIME)]
+
+
+def _filetime_100ns(ft):
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def _process_age_sec(pid):
+    """Seconds since the process was created, or None if it can't be queried."""
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                        ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            return None
+        now = wintypes.FILETIME()
+        kernel32.GetSystemTimeAsFileTime(ctypes.byref(now))
+        return max(0.0, (_filetime_100ns(now) - _filetime_100ns(created)) / 1e7)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pids_ready_for_injection(live_pids, seen_pids, first_seen, age_fn, now, min_age=None):
+    """PIDs not yet attempted whose process is old enough. If the real age can't
+    be read, the time since we first noticed the PID (kept in `first_seen`) stands in."""
+    limit = INJECT_MIN_PROCESS_AGE_SEC if min_age is None else min_age
+    ready = []
+    for pid in sorted(live_pids - seen_pids):
+        age = age_fn(pid)
+        if age is None:
+            age = now - first_seen.setdefault(pid, now)
+        if age >= limit:
+            ready.append(pid)
+    return ready
+
+
 def chitubox_hook_injector_loop():
     """Background daemon thread - watches for new CHITUBOX Pro.exe processes
     and injects goo_hook.dll into each one exactly once, so the ChituHook
@@ -89,13 +138,14 @@ def chitubox_hook_injector_loop():
         return
     logmsg("=== chitubox_hook_injector: watching for %s ===", CHITUBOX_PRO_EXE_NAME)
     seen_pids = set()
+    first_seen = {}
     while True:
         try:
             live_pids = set(_list_pids_by_exe_name(CHITUBOX_PRO_EXE_NAME))
             seen_pids &= live_pids  # forget PIDs that have since exited
-            for pid in live_pids - seen_pids:
+            first_seen = {pid: t for pid, t in first_seen.items() if pid in live_pids}
+            for pid in _pids_ready_for_injection(live_pids, seen_pids, first_seen, _process_age_sec, time.time()):
                 seen_pids.add(pid)
-                time.sleep(2)  # let the process clear its own very-early init before we touch it
                 ok, err = _inject_goo_hook(pid, GOO_HOOK_DLL_PATH)
                 logmsg("=== chitubox_hook_injector: %s pid=%d%s ===",
                        "injected goo_hook.dll into" if ok else "FAILED to inject into",
