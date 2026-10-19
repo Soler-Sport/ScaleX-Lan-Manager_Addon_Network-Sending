@@ -305,3 +305,16 @@ class TestSaveCtbComposition:
                 assert False, "expected RuntimeError"
             except RuntimeError:
                 pass
+
+
+class TestSummarizeUnmatched:
+    def test_groups_by_leading_article_biggest_first(self):
+        names = ["WW-35001_W_L_B.stl", "WW-35001_W_L_A.stl", "WW-35041_L_B.stl", "WW-35001_S.stl", "WW-35041_R_A.stl", "Sphere.stl"]
+
+        assert composition.summarize_unmatched(names) == [("WW-35001", 3), ("WW-35041", 2), ("Sphere", 1)]
+
+    def test_a_name_without_an_article_is_its_own_group(self):
+        assert composition.summarize_unmatched(["Odd name.stl", "Odd name.stl"]) == [("Odd name", 2)]
+
+    def test_empty_input_gives_no_groups(self):
+        assert composition.summarize_unmatched([]) == []

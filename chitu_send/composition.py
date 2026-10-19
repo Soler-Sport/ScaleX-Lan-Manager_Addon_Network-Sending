@@ -125,6 +125,22 @@ def _composition_item_label(component):
     return label
 
 
+_ARTICLE_RE = re.compile(r"^[A-Za-z]{1,4}-?\d{3,}")
+
+
+def summarize_unmatched(unmatched_names):
+    """[(article, count)] for model names that matched nothing, biggest group first. The
+    article is the leading code of the name (WW-35001_W_L_B.stl -> WW-35001); a name with no
+    such code is its own group. Lets the picker say "WW-35001 x14, WW-35041 x8" instead of
+    listing 22 file names."""
+    counts = {}
+    for name in unmatched_names:
+        m = _ARTICLE_RE.match(name)
+        key = m.group(0) if m else os.path.splitext(name)[0]
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
 def suggest_composition_matches(unmatched_names, components, cutoff=0.85):
     """Display-only "did you mean" for model names that matched no live
     warehouse component: {model_name: component label}. Never used to
