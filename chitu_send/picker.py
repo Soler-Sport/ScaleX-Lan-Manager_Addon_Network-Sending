@@ -8,7 +8,7 @@ import traceback
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget
 
-from .composition import _composition_item_label, match_composition_components, read_chitu_hook_model_names, suggest_composition_matches
+from .composition import _composition_item_label, match_composition_components, read_chitu_hook_model_names, suggest_composition_matches, summarize_unmatched
 from .ctb_file import extract_ctb_machine_name
 from .logs import logmsg
 from .printer_row import PrinterRowWidget
@@ -334,6 +334,7 @@ class PickerWindow(QMainWindow):
             self.composition_notice.setVisible(False)
             return
         parts = []
+        unmatched_detail = ""  # full per-model text, shown as a tooltip when the visible text is a summary
         if self.composition_matched:
             # 2026-09-29 (user request): show the actual detected article
             # per component instead of a generic "this came from ChituHook"
@@ -360,8 +361,18 @@ class PickerWindow(QMainWindow):
                 if n in hints:
                     item += " (на складе есть похожие: %s)" % " / ".join(hints[n])
                 shown.append(item)
-            parts.append("Без совпадения (%d): %s" % (len(self.composition_unmatched), ", ".join(shown)))
+            detail = "Без совпадения (%d): %s" % (len(self.composition_unmatched), ", ".join(shown))
+            if len(counts) > 3:
+                # A whole plate of unknown parts (22 file names with three "similar" codes each)
+                # was an unreadable wall of text: say it by article, keep the detail in the tooltip.
+                groups = ", ".join("%s ×%d" % g for g in summarize_unmatched(self.composition_unmatched))
+                parts.append("Без совпадения (%d): %s - подробности во всплывающей подсказке" %
+                             (len(self.composition_unmatched), groups))
+                unmatched_detail = detail
+            else:
+                parts.append(detail)
         self.composition_notice.setText("\n".join(parts))
+        self.composition_notice.setToolTip(unmatched_detail)
         self.composition_notice.setVisible(True)
 
     def _rebuild_composition_ambiguous_rows(self):
