@@ -1,9 +1,21 @@
 import json
+import re
 import os
 import threading
 
 from .logs import logmsg
 from .scalex import build_recommendation_patch, ctb_params, fetch_printers, forward_to_scalex, has_recommendations, patch_and_upload_single, poll_scalex_upload, start_stored_file
+
+
+_FORBIDDEN_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_upload_name(name):
+    """File name as ScaleX can store it: characters Windows forbids in file names (< > : " / backslash | ? *
+    and control characters) become "_". ScaleX answers HTTP 500 to such a name (seen 2026-10-19:
+    "WW-35001* x5.ctb" failed on every printer) and its Windows host cannot create the file."""
+    cleaned = _FORBIDDEN_NAME_CHARS.sub("_", name or "").strip()
+    return cleaned.rstrip(". ") or cleaned
 
 
 def send_in_background(file_path, targets, display_name=None, start_print=False, report_cb=None,
