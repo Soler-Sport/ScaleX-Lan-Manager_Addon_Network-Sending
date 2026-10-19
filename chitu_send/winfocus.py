@@ -49,6 +49,10 @@ def force_window_to_foreground(qwidget):
     AttachThreadInput does, so it doesn't carry the freeze risk that got
     AttachThreadInput ruled out above."""
     hwnd = int(qwidget.winId())
+    if not user32.IsWindowVisible(hwnd):
+        # Making an invisible window the foreground window sends all keyboard input into the void.
+        logmsg("=== force_window_to_foreground: window is not visible, not taking the foreground ===")
+        return
     old_timeout = wintypes.DWORD(0)
     user32.SystemParametersInfoW(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ctypes.byref(old_timeout), 0)
     user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, 0)

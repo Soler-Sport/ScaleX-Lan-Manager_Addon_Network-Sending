@@ -3,6 +3,7 @@ import json
 import os
 import re
 import threading
+import time
 import traceback
 from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget
@@ -732,6 +733,19 @@ def open_picker_window(dest_path, chitubox_conn=None):
     _get_host().add_picker(win)
 
 
+def _host_title(filenames):
+    """Title of the host window - never the bare "Network sending". CHITUBOX announces the
+    manager window with Title "Network Sending" (see the LoadWindow message) and appears to
+    hide a window carrying exactly that title: with the host so titled the picker stayed
+    invisible (2026-10-16/19) and the keyboard focus went to the hidden window. The old
+    one-window-per-file titles ("Network sending — <file>") were never affected."""
+    if len(filenames) == 1:
+        return "Network sending — %s" % filenames[0]
+    if len(filenames) > 1:
+        return "Network sending — %d плит(ы)" % len(filenames)
+    return "Network sending — ScaleX"
+
+
 class PickerHost(QMainWindow):
     """The single top-level window every PickerWindow lives in, one tab per
     captured file (2026-10-15: sending a batch of plates used to open one
@@ -742,8 +756,9 @@ class PickerHost(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Network sending")
+        self.setWindowTitle(_host_title([]))
         self.resize(780, 860)
+        self._last_reshow = 0.0
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(False)  # own close buttons, see add_picker - the stock ones are unthemeable
         self.tabs.setDocumentMode(True)
@@ -806,12 +821,24 @@ class PickerHost(QMainWindow):
     def _ensure_visible(self):
         if self.tabs.count() == 0 or self.isMinimized():
             return
-        if not self.isVisible() or not self._natively_visible():
-            logmsg("=== PickerHost was hidden with %d tab(s) open (qt visible=%s, native visible=%s) - showing it again ===",
-                   self.tabs.count(), self.isVisible(), self._natively_visible())
+        qt_visible, native_visible = self.isVisible(), self._natively_visible()
+        if qt_visible and native_visible:
+            return
+        # Rate-limited and never takes the foreground: an earlier version called
+        # force_window_to_foreground every 1.5 s on a window Windows kept reporting as
+        # hidden, which stole the keyboard focus from whatever the operator was typing in.
+        now = time.monotonic()
+        if now - self._last_reshow < 30:
+            return
+        self._last_reshow = now
+        logmsg("=== PickerHost was hidden with %d tab(s) open (qt visible=%s, native visible=%s) - showing it again ===",
+               self.tabs.count(), qt_visible, native_visible)
+        if not qt_visible:
             self.show()
-            self.raise_()
-            force_window_to_foreground(self)
+        try:
+            ctypes.windll.user32.ShowWindow(int(self.winId()), 4)  # SW_SHOWNOACTIVATE
+        except Exception:
+            pass
 
     def hideEvent(self, event):
         if self.tabs.count() > 0:
@@ -820,8 +847,7 @@ class PickerHost(QMainWindow):
         super().hideEvent(event)
 
     def _update_title(self):
-        n = self.tabs.count()
-        self.setWindowTitle("Network sending" if n <= 1 else "Network sending — %d плит(ы)" % n)
+        self.setWindowTitle(_host_title([self.tabs.widget(i).filename for i in range(self.tabs.count())]))
 
     def closeEvent(self, event):
         # No confirmation: a send already handed to the background uploader keeps
