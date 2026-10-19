@@ -14,7 +14,7 @@ from .logs import logmsg
 from .printer_row import PrinterRowWidget
 from .protocol import LOADWINDOW_CLOSE_NOTIFY
 from .scalex import fetch_all_warehouse_components, fetch_printers, save_ctb_composition
-from .sender import send_in_background
+from .sender import sanitize_upload_name, send_in_background
 from .winfocus import force_window_to_foreground
 
 
@@ -528,6 +528,11 @@ class PickerWindow(QMainWindow):
         src_ext = os.path.splitext(self.filename)[1]
         if src_ext and not display_name.lower().endswith(src_ext.lower()):
             display_name += src_ext
+        clean_name = sanitize_upload_name(display_name)
+        if clean_name != display_name:
+            logmsg("=== PICKER: file name \"%s\" has characters ScaleX cannot store, sending as \"%s\" ===", display_name, clean_name)
+            display_name = clean_name
+            self.filename_edit.setText(clean_name)  # show what is actually being sent
         test_print = self.test_print_cb.isChecked()
         # The same name is saved once per window: a second batch of the same file to
         # other printers must not re-PUT the (replace-style) composition.
