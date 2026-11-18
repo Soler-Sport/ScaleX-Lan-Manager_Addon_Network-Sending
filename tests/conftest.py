@@ -34,6 +34,13 @@ def _isolate_logmsg(monkeypatch):
     monkeypatch.setattr(logs, "_logf", io.StringIO())
 
 
+@pytest.fixture(autouse=True)
+def _no_real_device_cookie(monkeypatch, tmp_path):
+    """Never send (or write) the real ScaleX device cookie from a test."""
+    from chitu_send import config
+    monkeypatch.setattr(config, "DEVICE_FILE", str(tmp_path / "scalex_device.json"))
+
+
 @pytest.fixture
 def make_ctb_file(tmp_path):
     """Builds a real, byte-valid "CTB Encrypted" file exercising the exact

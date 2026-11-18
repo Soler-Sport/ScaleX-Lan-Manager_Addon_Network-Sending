@@ -40,11 +40,12 @@ SLICE_EXTENSIONS = (".ctb", ".goo", ".cbddlp", ".pwmx")
 POLL_INTERVAL_SEC = 2.0
 
 
+DEVICE_FILE = os.path.join(ROOT_DIR, "scalex_device.json")  # ScaleX device-access cookie, see device_access.py
 PENDING_DIR = os.path.join(ROOT_DIR, "pending")  # files requested straight from CHITUBOX over TCP
 
 
 # --- Your own manager (ScaleX LAN Manager, FastAPI/uvicorn) ---
-SCALEX_HOST = "192.168.0.118"
+SCALEX_HOST = "192.168.0.114"
 
 
 SCALEX_PORT = 8081

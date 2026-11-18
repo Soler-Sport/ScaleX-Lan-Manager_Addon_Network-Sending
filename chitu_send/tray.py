@@ -9,6 +9,10 @@ from .picker import open_picker_window
 from .theme import COLOR_ACCENT
 
 
+def show_notice(tray, text):
+    tray.showMessage("slm_chitu_send", text, QSystemTrayIcon.Warning, 15000)
+
+
 def show_waiting_notice(tray, slice_label):
     tray.showMessage(
         "slm_chitu_send",

@@ -269,6 +269,8 @@ class PickerWindow(QMainWindow):
     def _on_printers_loaded(self, printers, error):
         if error and not self._loaded_once:
             self.loading_label.setText(
+                "ScaleX не пускает это устройство: администратору нужно одобрить его в ScaleX и выдать разделы «Принтеры» и «Склад»."
+                if "device_access_denied" in error else
                 "Не удалось получить список принтеров ScaleX (см. лог). Проверьте, что ScaleX запущен и доступен по сети.")
             return
         if error:

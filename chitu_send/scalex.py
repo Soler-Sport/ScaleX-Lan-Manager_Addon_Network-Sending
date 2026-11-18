@@ -5,6 +5,7 @@ import time
 import urllib.parse
 
 from . import config
+from .device_access import device_headers
 from .logs import logmsg
 
 
@@ -14,11 +15,11 @@ from .logs import logmsg
 def fetch_printers():
     conn = http.client.HTTPConnection(config.SCALEX_HOST, config.SCALEX_PORT, timeout=10)
     try:
-        conn.request("GET", "/api/printers")
+        conn.request("GET", "/api/printers", headers=device_headers())
         resp = conn.getresponse()
         body = resp.read()
         if resp.status != 200:
-            raise RuntimeError("HTTP %d" % resp.status)
+            raise RuntimeError("HTTP %d%s" % (resp.status, " device_access_denied" if b"device_access_denied" in body else ""))
         return json.loads(body.decode("utf-8", "replace"))
     finally:
         conn.close()
@@ -52,6 +53,7 @@ def fetch_warehouse_components(context="warehouse"):
     conn = http.client.HTTPConnection(config.SCALEX_HOST, config.SCALEX_PORT, timeout=10)
     try:
         headers = {} if context == "warehouse" else {"X-Warehouse-Context": context}
+        headers.update(device_headers())
         conn.request("GET", "/api/warehouse", headers=headers)
         resp = conn.getresponse()
         body = resp.read()
@@ -101,6 +103,7 @@ def save_ctb_composition(file_name, component_quantities, context="warehouse"):
         headers = {"Content-Type": "application/json"}
         if context != "warehouse":
             headers["X-Warehouse-Context"] = context
+        headers.update(device_headers())
         conn.request("PUT", "/api/warehouse/ctb-mappings", body=body, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
@@ -143,6 +146,7 @@ def _post_raw_file(path, body_bytes, extra_headers):
             "X-File-Name": filename_header,
         }
         headers.update(extra_headers)
+        headers.update(device_headers())
         conn.request("POST", path, body=data, headers=headers)
         resp = conn.getresponse()
         resp_body = resp.read()
@@ -231,7 +235,7 @@ def create_bulk_from_draft(draft_id, targets):
     try:
         body = json.dumps({"draftId": draft_id, "targets": targets}).encode("utf-8")
         conn.request("POST", "/api/bulk-uploads/from-draft", body=body,
-                      headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+                      headers={"Content-Type": "application/json", "Content-Length": str(len(body)), **device_headers()})
         resp = conn.getresponse()
         resp_body = resp.read()
         return resp.status, resp_body
@@ -279,7 +283,7 @@ def patch_and_upload_single(draft_id, printer_id, patch, auto_start, test_print=
             payload["testPrint"] = True
         body = json.dumps(payload).encode("utf-8")
         conn.request("POST", "/api/ctb/patch-and-upload", body=body,
-                      headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+                      headers={"Content-Type": "application/json", "Content-Length": str(len(body)), **device_headers()})
         resp = conn.getresponse()
         resp_body = resp.read()
         return resp.status, resp_body
@@ -303,7 +307,7 @@ def start_stored_file(printer_id, path, queue_if_not_prepared):
     try:
         body = json.dumps({"path": path, "queueIfNotPrepared": bool(queue_if_not_prepared)}).encode("utf-8")
         conn.request("POST", "/api/printers/%s/stored-files/start" % urllib.parse.quote(str(printer_id), safe=""),
-                      body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+                      body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body)), **device_headers()})
         resp = conn.getresponse()
         resp_body = resp.read()
         return resp.status, resp_body
@@ -353,7 +357,7 @@ def poll_scalex_upload(path, filename, timeout_sec=1800, interval_sec=2.0, progr
             # other failure mode here does. Caught during test-writing
             # 2026-08-31, not live - fixed defensively either way.
             conn = http.client.HTTPConnection(config.SCALEX_HOST, config.SCALEX_PORT, timeout=15)
-            conn.request("GET", path)
+            conn.request("GET", path, headers=device_headers())
             resp = conn.getresponse()
             body = resp.read()
         except Exception as e:
