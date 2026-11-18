@@ -17,8 +17,9 @@ from .logs import logmsg
 from .picker import open_picker_window
 from .protocol import _chitubox_accept_loop
 from .shm import SHM_NAME, create_shared_memory
+from .device_access import ensure_device_access
 from .theme import apply_theme
-from .tray import _make_tray_icon, build_tray_icon, show_waiting_notice
+from .tray import _make_tray_icon, build_tray_icon, show_notice, show_waiting_notice
 from .watchdog import _start_hang_watchdog
 from .watchers import _pending_dir_watcher, slicer_file_watcher
 
@@ -35,6 +36,14 @@ def _install_exception_logging():
 
     sys.excepthook = _log_uncaught
     threading.excepthook = _log_thread_uncaught
+
+
+def _check_device_access():
+    """ScaleX only talks to devices an admin approved: enroll this machine if needed and tell the
+    operator what is still missing (a tray notice), instead of every send just failing."""
+    message = ensure_device_access()
+    if message:
+        app_controller.controller.notice.emit(message)
 
 
 def main():
@@ -68,7 +77,9 @@ def main():
     tray, tray_menu, tray_actions = build_tray_icon(app)  # noqa: F841 - refs kept alive deliberately
     hang_timer = _start_hang_watchdog()  # noqa: F841 - ref kept alive deliberately
     app_controller.controller.save_requested.connect(lambda label: show_waiting_notice(tray, label), Qt.QueuedConnection)
+    app_controller.controller.notice.connect(lambda text: show_notice(tray, text), Qt.QueuedConnection)
 
+    threading.Thread(target=_check_device_access, daemon=True).start()
     threading.Thread(target=slicer_file_watcher, daemon=True).start()
     threading.Thread(target=_pending_dir_watcher, daemon=True).start()
     threading.Thread(target=_received_dir_cleanup_loop, daemon=True).start()

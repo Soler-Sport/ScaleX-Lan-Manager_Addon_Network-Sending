@@ -17,6 +17,8 @@ class AppController(QObject):
     # (scales with size, see the log), and nothing on screen says the click
     # registered meanwhile. The GUI thread shows a tray notice.
     save_requested = Signal(str)
+    # Plain tray notice from a background thread (ScaleX device-access status).
+    notice = Signal(str)
 
 
 controller = None  # created in main(), before any background thread starts
